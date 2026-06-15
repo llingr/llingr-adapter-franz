@@ -25,7 +25,7 @@ var _ nexus.BandwidthPort[*kgo.Record] = (*Adapter)(nil)
 // at client creation via kgo.ConsumeTopics(), so this validates readiness.
 // Topic name is provided at adapter construction, not here.
 func (a *Adapter) Subscribe() error {
-	a.logger.Info(a.ctx, "franz-go subscribed to topic: %s", a.topicName)
+	a.logger.Info(a.ctx, fmt.Sprintf("franz-go subscribed to topic: %s", a.topicName))
 	return nil
 }
 
@@ -72,7 +72,7 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return
 		}
-		a.logger.Error(a.ctx, "poll error on %s[%d]: %v", topic, partition, err)
+		a.logger.Error(a.ctx, fmt.Sprintf("poll error on %s[%d]: %v", topic, partition, err))
 		pollErr = err
 	})
 	if pollErr != nil {
@@ -135,12 +135,12 @@ func (a *Adapter) CommitOffsets(messages []*nexus.Message[*kgo.Record]) ([]*nexu
 	}
 
 	if err := a.commitRecordsFn(a.ctx, records...); err != nil {
-		a.logger.Error(a.ctx, "failed to commit offsets: %v", err)
+		a.logger.Error(a.ctx, fmt.Sprintf("failed to commit offsets: %v", err))
 		a.logGroupMembershipHintIfApplicable(err)
 		return nil, fmt.Errorf("commit records failed: %w", err)
 	}
 
-	a.logger.Debug(a.ctx, "committed %d offsets", len(records))
+	a.logger.Debug(a.ctx, fmt.Sprintf("committed %d offsets", len(records)))
 	return nil, nil
 }
 
@@ -153,9 +153,9 @@ func (a *Adapter) logGroupMembershipHintIfApplicable(err error) {
 	if !errors.Is(err, kerr.UnknownMemberID) && !errors.Is(err, kerr.IllegalGeneration) {
 		return
 	}
-	a.logger.Warn(a.ctx,
-		"commit rejected (group membership lost): session timeout currently %s — likely exceeded during drain, raise via kgo.SessionTimeout(...)",
-		a.currentSessionTimeoutDescription())
+	a.logger.Warn(a.ctx, fmt.Sprintf(
+		"commit rejected (group membership lost): session timeout currently %s - likely exceeded during drain, raise via kgo.SessionTimeout(...)",
+		a.currentSessionTimeoutDescription()))
 }
 
 // currentSessionTimeoutDescription returns a human-readable description of the

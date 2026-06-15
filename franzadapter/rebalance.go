@@ -75,7 +75,7 @@ func (a *Adapter) triggerAssign(assigned map[string][]int32) error {
 		}
 	}
 
-	a.logger.Info(a.ctx, "partitions assigned: %v", assigned)
+	a.logger.Info(a.ctx, fmt.Sprintf("partitions assigned: %v", assigned))
 	if err := a.adaptedConsumer.TriggerRebalance(nexus.Assign, info); err != nil {
 		return fmt.Errorf("failed to trigger rebalance (assign): %w", err)
 	}
@@ -98,7 +98,7 @@ func (a *Adapter) triggerRevoke(revoked map[string][]int32) error {
 		}
 	}
 
-	a.logger.Info(a.ctx, "partitions revoked: %v", revoked)
+	a.logger.Info(a.ctx, fmt.Sprintf("partitions revoked: %v", revoked))
 	if err := a.adaptedConsumer.TriggerRebalance(nexus.Revoke, info); err != nil {
 		return fmt.Errorf("failed to trigger rebalance (revoke): %w", err)
 	}
