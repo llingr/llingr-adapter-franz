@@ -210,7 +210,7 @@ func TestBandwidthCollector_NoCallbackNoPanic(t *testing.T) {
 	// verify no panic when callback is nil
 	bc := newBandwidthCollector(50*time.Millisecond, "test-group", "test-topic")
 
-	// no callback set — emit should not panic
+	// no callback set, emit should not panic
 	meta := kgo.BrokerMetadata{NodeID: 1, Host: "broker", Port: 9092}
 	bc.recordFetchBatch(meta, 0, kgo.FetchBatchMetrics{NumRecords: 1, UncompressedBytes: 10})
 	bc.emit() // should be safe with nil callback

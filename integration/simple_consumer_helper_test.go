@@ -104,7 +104,7 @@ func (c *SimpleConsumer) pollLoop() {
 
 		msg, ok, err := c.broker.Poll(defaultPollTimeout)
 		if err != nil {
-			c.logger.Error(c.ctx, "poll error: %v", err)
+			c.logger.Error(c.ctx, fmt.Sprintf("poll error: %v", err))
 			continue
 		}
 		if !ok {
