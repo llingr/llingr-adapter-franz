@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/llingr/llingr-nexus v0.10.0
-	github.com/twmb/franz-go v1.21.2
+	github.com/twmb/franz-go v1.21.3
 )
 
 require (
