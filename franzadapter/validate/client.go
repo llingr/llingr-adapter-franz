@@ -72,6 +72,10 @@ func ensureBlockRebalanceOnPoll(client *kgo.Client) {
 	}
 }
 
+// Rebalance callbacks (OnPartitionsAssigned/Revoked/Lost) are not validated:
+// franz-go wraps them non-nil at client creation, so OptValue always reports
+// them present. Adapter.RequiredOpts carries them instead.
+
 // logBalancerProtocol logs the configured rebalancing protocol for operational visibility.
 //
 // Franz-go supports both cooperative and eager rebalancing strategies:

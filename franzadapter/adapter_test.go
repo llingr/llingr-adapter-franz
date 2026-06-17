@@ -5,6 +5,8 @@ package franzadapter
 
 import (
 	"context"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,6 +105,28 @@ func TestNewWithOptions(t *testing.T) {
 	})
 }
 
+func TestNewWithOptions_PanicsOnEmptyGroup(t *testing.T) {
+	for _, name := range []string{"NewWithOptions", "New"} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("expected panic on empty consumer group")
+				}
+				msg, _ := r.(string)
+				if !strings.Contains(msg, "consumer group") {
+					t.Errorf("panic should name the consumer group, got: %v", r)
+				}
+			}()
+			if name == "New" {
+				New(context.Background(), "", "broker:9092")
+			} else {
+				NewWithOptions(context.Background(), "", []string{"broker:9092"})
+			}
+		})
+	}
+}
+
 func TestNewCustom(t *testing.T) {
 	t.Run("creates empty adapter", func(t *testing.T) {
 		adapter := NewCustom()
@@ -131,6 +155,46 @@ func TestNewCustom(t *testing.T) {
 			t.Error("pendingRevoked should be initialised")
 		}
 	})
+
+	t.Run("seeds default poll-error options", func(t *testing.T) {
+		o := NewCustom().opts
+		if o.pollErrorBailAfter != 10*time.Minute {
+			t.Errorf("PollErrorBailAfter = %s, want 10m", o.pollErrorBailAfter)
+		}
+		if o.pollErrorBackoff != 25*time.Millisecond {
+			t.Errorf("PollErrorBackoff = %s, want 25ms", o.pollErrorBackoff)
+		}
+		if o.pollErrorLogInterval != time.Second {
+			t.Errorf("PollErrorLogInterval = %s, want 1s", o.pollErrorLogInterval)
+		}
+		if o.bailTerminate == nil {
+			t.Error("BailTerminate should default to a non-nil action")
+		}
+	})
+}
+
+// TestWithOptions is a higher-level check that the options reach the adapter:
+// the option-resolution logic itself is unit-tested in adapter_options_test.go.
+func TestWithOptions(t *testing.T) {
+	t.Run("folds options over defaults and validates", func(t *testing.T) {
+		a := NewCustom().WithOptions(WithPollErrorBackoff(30 * time.Second))
+		if a.opts.pollErrorBackoff != 5*time.Second {
+			t.Errorf("backoff = %s, want clamped 5s", a.opts.pollErrorBackoff)
+		}
+		if a.opts.pollErrorBailAfter != 10*time.Minute {
+			t.Errorf("unset bailAfter = %s, want default 10m", a.opts.pollErrorBailAfter)
+		}
+		if a.opts.bailTerminate == nil {
+			t.Error("unset BailTerminate should default to non-nil")
+		}
+	})
+	t.Run("zero disables bail and backoff", func(t *testing.T) {
+		a := NewCustom().WithOptions(WithPollErrorBailAfter(0), WithPollErrorBackoff(0))
+		if a.opts.pollErrorBailAfter != 0 || a.opts.pollErrorBackoff != 0 {
+			t.Errorf("zero should disable: bail=%s backoff=%s",
+				a.opts.pollErrorBailAfter, a.opts.pollErrorBackoff)
+		}
+	})
 }
 
 func TestSetClient(t *testing.T) {
@@ -156,6 +220,31 @@ func TestSetClient(t *testing.T) {
 			t.Error("client should be set on adapter")
 		}
 	})
+}
+
+func TestRequiredOpts(t *testing.T) {
+	opts := NewCustom().RequiredOpts()
+	if len(opts) != 5 {
+		t.Fatalf("RequiredOpts len = %d, want 5", len(opts))
+	}
+
+	// A client built with RequiredOpts must satisfy the enforced client checks.
+	client, err := kgo.NewClient(append([]kgo.Opt{
+		kgo.SeedBrokers("localhost:9092"),
+		kgo.ConsumerGroup("test-group"),
+		kgo.ConsumeTopics("test-topic"),
+	}, opts...)...)
+	if err != nil {
+		t.Fatalf("failed to build client with RequiredOpts: %v", err)
+	}
+	defer client.Close()
+
+	if v, _ := client.OptValue(kgo.DisableAutoCommit).(bool); !v {
+		t.Error("RequiredOpts should disable auto-commit")
+	}
+	if v, _ := client.OptValue(kgo.BlockRebalanceOnPoll).(bool); !v {
+		t.Error("RequiredOpts should set BlockRebalanceOnPoll")
+	}
 }
 
 func TestCreateConsumer_Errors(t *testing.T) {
@@ -249,10 +338,11 @@ type mockAdaptedConsumer struct {
 	lastRebalanceInfo      []nexus.RebalanceInfo
 	ctx                    context.Context
 	logger                 nexus.Logger
+	shutdownCalled         atomic.Bool
 }
 
 func (m *mockAdaptedConsumer) Subscribe() error         { return nil }
-func (m *mockAdaptedConsumer) Shutdown() error          { return nil }
+func (m *mockAdaptedConsumer) Shutdown() error          { m.shutdownCalled.Store(true); return nil }
 func (m *mockAdaptedConsumer) TopicName() string        { return "test-topic" }
 func (m *mockAdaptedConsumer) Context() context.Context { return m.ctx }
 func (m *mockAdaptedConsumer) Logger() nexus.Logger     { return m.logger }

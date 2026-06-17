@@ -227,7 +227,7 @@ func generateUUID() string {
 // --- BandwidthPort[*kgo.Record] implementation on Adapter ---
 
 // SetBandwidthCallback registers the framework callback and starts the
-// emission timer. Called by the demux builder during Build().
+// emission timer. Called by the nexus.ConsumerBuilder during Build().
 func (a *Adapter) SetBandwidthCallback(cb nexus.BandwidthCallback) {
 	if a.bwCollector == nil {
 		return

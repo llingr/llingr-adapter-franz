@@ -6,6 +6,7 @@ package franzadapter
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -334,9 +335,9 @@ func TestPoll_EmptyFetches(t *testing.T) {
 func TestPoll_PartitionError(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
-	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
+	logger := &capturingLogger{}
+	adapter.logger = logger
+	adapter.opts.pollErrorBailAfter = 0 // disable bail; just exercise the error handling
 
 	expectedErr := errors.New("partition error")
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
@@ -346,17 +347,253 @@ func TestPoll_PartitionError(t *testing.T) {
 
 	msg, ok, err := adapter.Poll(100 * time.Millisecond)
 
-	if err == nil {
-		t.Error("expected error")
-	}
-	if !errors.Is(err, expectedErr) {
-		t.Errorf("expected %v, got %v", expectedErr, err)
+	// Partition errors are absorbed (logged, not returned) so the consumer's
+	// poll loop does not re-log them on every poll.
+	if err != nil {
+		t.Errorf("expected nil error (absorbed), got %v", err)
 	}
 	if ok {
 		t.Error("expected ok=false")
 	}
 	if msg != nil {
 		t.Error("expected nil message")
+	}
+	if !logger.errorCalled || !contains(logger.lastErrorMsg, "partition error") {
+		t.Errorf("expected the partition error to be logged, got %q", logger.lastErrorMsg)
+	}
+}
+
+// makeFetchesRecordAndError builds a Fetches with a record on one partition and
+// an error on another, in the same fetch response.
+func makeFetchesRecordAndError(rec *kgo.Record, errPartition int32, err error) kgo.Fetches {
+	return kgo.Fetches{{
+		Topics: []kgo.FetchTopic{{
+			Topic: testTopicName,
+			Partitions: []kgo.FetchPartition{
+				{Partition: rec.Partition, Records: []*kgo.Record{rec}},
+				{Partition: errPartition, Err: err},
+			},
+		}},
+	}}
+}
+
+// A single failing partition must not starve healthy ones: a record fetched
+// alongside a partition error is still delivered.
+func TestPoll_DeliversRecordDespitePartitionError(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	adapter.opts.pollErrorBailAfter = 0
+	adapter.allowRebalanceFn = func() {}
+
+	rec := &kgo.Record{Key: []byte("k"), Value: []byte("v"), Topic: testTopicName, Partition: 0, Offset: 5}
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		return makeFetchesRecordAndError(rec, 1, errors.New("partition 1 boom"))
+	}
+
+	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if !ok || msg == nil {
+		t.Fatal("expected the healthy-partition record to be delivered despite the partition-1 error")
+	}
+	if msg.Partition != 0 {
+		t.Errorf("expected record from partition 0, got %d", msg.Partition)
+	}
+}
+
+// Repeated identical partition errors are logged at most once per log interval.
+func TestPoll_RateLimitsErrorLogs(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	logger := &capturingLogger{}
+	adapter.logger = logger
+	adapter.opts.pollErrorLogInterval = time.Hour // effectively "log once"
+	adapter.opts.pollErrorBailAfter = 0
+	adapter.opts.pollErrorBackoff = 0 // not under test here; keep the loop snappy
+	adapter.allowRebalanceFn = func() {}
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		return makeFetchesWithError(0, errors.New("boom"))
+	}
+
+	for i := 0; i < 5; i++ {
+		_, _, _ = adapter.Poll(10 * time.Millisecond)
+	}
+
+	if logger.errorCount != 1 {
+		t.Errorf("expected exactly 1 error log under rate-limit, got %d", logger.errorCount)
+	}
+}
+
+// A changed error on the same partition logs immediately, even inside the
+// rate-limit window: distinct failure modes are never hidden behind the throttle.
+func TestPoll_LogsImmediatelyOnChangedError(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	logger := &capturingLogger{}
+	adapter.logger = logger
+	adapter.opts.pollErrorLogInterval = time.Hour // throttle hard so only a CHANGE can re-log
+	adapter.opts.pollErrorBailAfter = 0
+	adapter.opts.pollErrorBackoff = 0 // not under test here; keep the loop snappy
+	adapter.allowRebalanceFn = func() {}
+
+	var call int
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		call++
+		if call < 3 {
+			return makeFetchesWithError(1, errors.New("error A"))
+		}
+		return makeFetchesWithError(1, errors.New("error B"))
+	}
+
+	for i := 0; i < 4; i++ {
+		_, _, _ = adapter.Poll(10 * time.Millisecond)
+	}
+
+	// A logged once (polls 1-2 throttled to 1), then B logged once on change = 2.
+	if logger.errorCount != 2 {
+		t.Errorf("expected 2 logs (A once, then B on change), got %d", logger.errorCount)
+	}
+	if !contains(logger.lastErrorMsg, "error B") {
+		t.Errorf("expected the last log to carry the changed error, got %q", logger.lastErrorMsg)
+	}
+}
+
+// A broker error with no record backs off for the configured duration (so the
+// loop does not spin); the backoff is set via the public option, honours the
+// specified amount, is context-aware (cancelled context returns promptly), and
+// is disablable with 0.
+func TestPoll_BacksOffOnBrokerError(t *testing.T) {
+	// newErrAdapter wires an adapter whose every poll returns a broker error and
+	// no record, with an explicit backoff (set directly to bypass clamping so
+	// exact test durations stand).
+	newErrAdapter := func(ctx context.Context, backoff time.Duration) *Adapter {
+		a := NewCustom()
+		a.ctx = ctx
+		a.logger = &capturingLogger{}
+		a.opts.pollErrorBackoff = backoff
+		a.opts.pollErrorBailAfter = 0
+		a.allowRebalanceFn = func() {}
+		a.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+			return makeFetchesWithError(1, errors.New("boom"))
+		}
+		return a
+	}
+
+	// Confirm the pause actually tracks the configured amount: each value waits
+	// at least its duration (minus a small scheduling epsilon) and does not run
+	// away far beyond it. A larger setting must also wait longer than a smaller
+	// one, proving the option value is honoured rather than a fixed constant.
+	t.Run("backs off to the configured amount", func(t *testing.T) {
+		var elapsedFor = map[time.Duration]time.Duration{}
+		for _, d := range []time.Duration{30 * time.Millisecond, 120 * time.Millisecond} {
+			start := time.Now()
+			_, _, _ = newErrAdapter(context.Background(), d).Poll(time.Millisecond)
+			elapsed := time.Since(start)
+			elapsedFor[d] = elapsed
+			if elapsed < d-10*time.Millisecond {
+				t.Errorf("backoff %s: returned too early in %s", d, elapsed)
+			}
+			if elapsed > d+500*time.Millisecond {
+				t.Errorf("backoff %s: waited far longer than configured (%s)", d, elapsed)
+			}
+		}
+		if elapsedFor[120*time.Millisecond] <= elapsedFor[30*time.Millisecond] {
+			t.Errorf("larger backoff should wait longer: 120ms→%s vs 30ms→%s",
+				elapsedFor[120*time.Millisecond], elapsedFor[30*time.Millisecond])
+		}
+	})
+
+	t.Run("cancelled context skips the backoff", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		start := time.Now()
+		_, _, _ = newErrAdapter(ctx, 5*time.Second).Poll(time.Millisecond)
+		if elapsed := time.Since(start); elapsed >= time.Second {
+			t.Errorf("expected the cancelled context to skip the backoff, took %s", elapsed)
+		}
+	})
+
+	t.Run("zero backoff disables the pause", func(t *testing.T) {
+		start := time.Now()
+		_, _, _ = newErrAdapter(context.Background(), 0).Poll(time.Millisecond)
+		if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
+			t.Errorf("expected no pause with backoff disabled, took %s", elapsed)
+		}
+	})
+}
+
+// A partition that keeps failing past the bail-after window stops the consumer once.
+func TestPoll_BailsAfterSustainedError(t *testing.T) {
+	mac := &mockAdaptedConsumer{ctx: context.Background(), logger: &mockLogger{}}
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	adapter.adaptedConsumer = mac
+	adapter.opts.pollErrorBailAfter = 20 * time.Millisecond
+	adapter.allowRebalanceFn = func() {}
+	// Stub the process-termination action so the bail does not os.Exit the test
+	// binary; record that it fired.
+	var terminated atomic.Bool
+	adapter.opts.bailTerminate = func() { terminated.Store(true) }
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		return makeFetchesWithError(1, errors.New("persistent error"))
+	}
+
+	_, _, _ = adapter.Poll(10 * time.Millisecond) // starts the streak
+	time.Sleep(30 * time.Millisecond)             // exceed the bail threshold
+	_, _, _ = adapter.Poll(10 * time.Millisecond) // trips the bail
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !terminated.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !mac.shutdownCalled.Load() {
+		t.Error("expected Shutdown to be called after sustained poll errors")
+	}
+	if !terminated.Load() {
+		t.Error("expected the process to be terminated after the bail Shutdown")
+	}
+}
+
+// A partition's failure streak must keep accumulating across interleaved
+// healthy polls from OTHER partitions: kgo not fetching the bad partition on a
+// given poll is not recovery. Regression test: previously the streak reset
+// whenever the bad partition was merely absent from a poll's errors.
+func TestPoll_BailStreakSurvivesHealthyPolls(t *testing.T) {
+	mac := &mockAdaptedConsumer{ctx: context.Background(), logger: &mockLogger{}}
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	adapter.adaptedConsumer = mac
+	adapter.opts.pollErrorBailAfter = 30 * time.Millisecond
+	adapter.opts.pollErrorLogInterval = time.Hour
+	adapter.allowRebalanceFn = func() {}
+	var terminated atomic.Bool
+	adapter.opts.bailTerminate = func() { terminated.Store(true) }
+
+	healthy := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 1}
+	var call int
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		call++
+		if call%2 == 0 {
+			return makeFetches(healthy) // healthy poll from partition 0, no p1 error
+		}
+		return makeFetchesWithError(1, errors.New("persistent error")) // p1 error
+	}
+
+	for i := 0; i < 12; i++ {
+		_, _, _ = adapter.Poll(5 * time.Millisecond)
+		time.Sleep(8 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && !terminated.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !mac.shutdownCalled.Load() || !terminated.Load() {
+		t.Error("expected bail despite interleaved healthy polls (streak must not reset on absence)")
 	}
 }
 
@@ -696,6 +933,7 @@ type capturingLogger struct {
 	infoCalled   bool
 	warnCalled   bool
 	errorCalled  bool
+	errorCount   int
 	lastInfoMsg  string
 	lastErrorMsg string
 }
@@ -715,6 +953,7 @@ func (l *capturingLogger) Warn(_ context.Context, _ string, _ ...any) {
 
 func (l *capturingLogger) Error(_ context.Context, format string, _ ...any) {
 	l.errorCalled = true
+	l.errorCount++
 	l.lastErrorMsg = format
 }
 
@@ -754,4 +993,3 @@ func TestUnsubscribe_WithBandwidthCollector(t *testing.T) {
 		t.Errorf("Unsubscribe returned error: %v", err)
 	}
 }
-

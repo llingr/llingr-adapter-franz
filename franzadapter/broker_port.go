@@ -66,19 +66,8 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		return nil, false, err
 	}
 
-	// check for errors (ignore timeout)
-	var pollErr error
-	fetches.EachError(func(topic string, partition int32, err error) {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return
-		}
-		a.logger.Error(a.ctx, fmt.Sprintf("poll error on %s[%d]: %v", topic, partition, err))
-		pollErr = err
-	})
-	if pollErr != nil {
-		return nil, false, pollErr
-	}
-
+	// Deliver a record from a healthy partition first; a single failing
+	// partition must not starve the others.
 	var record *kgo.Record
 	fetches.EachRecord(func(r *kgo.Record) {
 		if record == nil {
@@ -86,11 +75,145 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		}
 	})
 
-	if record == nil {
-		return nil, false, nil
+	// Rate-limit-log per-partition fetch errors and bail if one persists.
+	// Errors are absorbed (not returned) so the consumer's poll loop does not
+	// re-log them on every poll.
+	sawErr := a.handlePollErrors(fetches)
+
+	if record != nil {
+		return record, true, nil
 	}
 
-	return record, true, nil
+	// Broker error with no record: back off briefly so the loop does not spin on
+	// a broker that returns buffered errors immediately. Context-aware, and
+	// skipped when the backoff is disabled (0).
+	if sawErr && a.opts.pollErrorBackoff > 0 {
+		select {
+		case <-time.After(a.opts.pollErrorBackoff):
+		case <-a.ctx.Done():
+		}
+	}
+	return nil, false, nil
+}
+
+// handlePollErrors logs per-partition fetch errors and bails the consumer once
+// a partition has been failing for PollErrorBailAfter. Timeout errors are
+// ignored, and errors are absorbed rather than returned so the poll loop does
+// not re-log them every poll. Logging is throttled per partition to once per
+// PollErrorLogInterval, except a changed error (by errIdentity) logs at once.
+// Returns whether a real (non-timeout, non-recovered) error was seen, so the
+// caller can back off.
+func (a *Adapter) handlePollErrors(fetches kgo.Fetches) bool {
+	if a.pollErrSince == nil {
+		a.pollErrSince = make(map[string]time.Time)
+	}
+	if a.pollErrLogged == nil {
+		a.pollErrLogged = make(map[string]time.Time)
+	}
+	if a.pollErrLastID == nil {
+		a.pollErrLastID = make(map[string]string)
+	}
+	logEvery := a.opts.pollErrorLogInterval
+	if logEvery <= 0 {
+		logEvery = defaultPollErrorLogInterval
+	}
+
+	// A partition that delivered a record this poll has recovered. Mere absence
+	// from this poll's errors has not: kgo may just not have fetched it this
+	// round, so absence must not reset the streak or the bail timer never grows.
+	recovered := make(map[string]struct{})
+	fetches.EachRecord(func(r *kgo.Record) {
+		recovered[r.Topic+"-"+strconv.Itoa(int(r.Partition))] = struct{}{}
+	})
+	for key := range recovered {
+		delete(a.pollErrSince, key)
+		delete(a.pollErrLogged, key)
+		delete(a.pollErrLastID, key)
+	}
+
+	now := time.Now()
+	var bailReason error
+	var sawErr bool
+
+	fetches.EachError(func(topic string, partition int32, err error) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		key := topic + "-" + strconv.Itoa(int(partition))
+		if _, recoveredThisPoll := recovered[key]; recoveredThisPoll {
+			return // delivered a record despite an error; treat as progress
+		}
+		sawErr = true
+
+		since, ok := a.pollErrSince[key]
+		if !ok {
+			since = now
+			a.pollErrSince[key] = since
+		}
+		streak := now.Sub(since)
+
+		// Log on the first error, once the window elapses, or when the error
+		// changed (so distinct failure modes are not hidden by the throttle).
+		id := errIdentity(err)
+		last, logged := a.pollErrLogged[key]
+		changed := id != a.pollErrLastID[key]
+		if !logged || changed || now.Sub(last) >= logEvery {
+			a.logger.Error(a.ctx, fmt.Sprintf("poll error on %s[%d] (failing for %s): %v",
+				topic, partition, streak.Truncate(time.Second), err))
+			a.pollErrLogged[key] = now
+			a.pollErrLastID[key] = id
+		}
+
+		if a.opts.pollErrorBailAfter > 0 && streak >= a.opts.pollErrorBailAfter {
+			bailReason = fmt.Errorf("partition %s[%d] failing to fetch for %s: %w",
+				topic, partition, a.opts.pollErrorBailAfter, err)
+		}
+	})
+
+	if bailReason != nil {
+		a.bail(bailReason)
+	}
+	return sawErr
+}
+
+// errIdentity returns a stable fingerprint used to detect when a partition's
+// poll error has changed. Kafka protocol errors collapse to their numeric code
+// (their string form is constant per code); any other error uses its full
+// string, so distinct network/IO failures (which embed addresses) are treated
+// as distinct and each gets surfaced.
+func errIdentity(err error) string {
+	var ke *kerr.Error
+	if errors.As(err, &ke) {
+		return "kafka:" + strconv.Itoa(int(ke.Code))
+	}
+	return err.Error()
+}
+
+// bail stops the consumer once, asynchronously, after sustained poll failures,
+// then terminates the process so the orchestrator reschedules the pod rather
+// than leaving a zombie replica consuming nothing. The whole sequence runs in a
+// goroutine because Shutdown stops this very polling loop; calling it inline
+// would deadlock. Termination happens after Shutdown so offsets are committed
+// and in-flight work drains first; it runs even if Shutdown errors, because a
+// stuck partition must not keep the pod alive. The terminate action is
+// configurable via WithBailTerminate (default os.Exit(1)).
+func (a *Adapter) bail(reason error) {
+	a.bailOnce.Do(func() {
+		a.logger.Error(a.ctx, fmt.Sprintf("stopping consumer after sustained poll failure: %v", reason))
+		go func() {
+			if a.adaptedConsumer != nil {
+				if err := a.adaptedConsumer.Shutdown(); err != nil {
+					a.logger.Error(a.ctx, fmt.Sprintf("shutdown after poll-error bail failed: %v", err))
+				}
+			}
+			terminate := a.opts.bailTerminate
+			if terminate == nil {
+				terminate = defaultBailTerminate
+			}
+			a.logger.Error(a.ctx, "terminating process after poll-error bail so the orchestrator can reschedule")
+			terminate()
+		}()
+	})
 }
 
 // ExtractEnvelope maps a kgo.Record to nexus.Envelope.
