@@ -11,7 +11,8 @@
 // For most use cases, use New() which handles all client configuration.
 // Topic name is provided via the builder's WithTopicName(), not here.
 //
-//	builder := demux.NewBuilder(processOrder, handleDeadLetter).
+//	// builder is your nexus.ConsumerBuilder
+//	builder := NewBuilder(processOrder, handleDeadLetter).
 //	    WithTopicName("orders")
 //
 //	adapter := franzadapter.New(ctx, "my-group",
@@ -41,20 +42,15 @@
 //
 //	adapter := franzadapter.NewCustom()
 //
-//	// Topic must match builder.WithTopicName()
-//	client, err := kgo.NewClient(
+//	// Topic must match builder.WithTopicName(). adapter.RequiredOpts() carries
+//	// the auto-commit, block-rebalance, and rebalance-callback options.
+//	opts := append([]kgo.Opt{
 //	    kgo.SeedBrokers("localhost:9092"),
 //	    kgo.ConsumerGroup("my-group"),
 //	    kgo.ConsumeTopics("orders"),
-//	    // Required options:
-//	    kgo.DisableAutoCommit(),
-//	    kgo.BlockRebalanceOnPoll(),
-//	    kgo.OnPartitionsAssigned(adapter.OnAssigned),
-//	    kgo.OnPartitionsRevoked(adapter.OnRevoked),
-//	    kgo.OnPartitionsLost(adapter.OnLost),
-//	    // Your custom options:
-//	    kgo.MaxConcurrentFetches(2),
-//	)
+//	    kgo.MaxConcurrentFetches(2), // your custom options
+//	}, adapter.RequiredOpts()...)
+//	client, err := kgo.NewClient(opts...)
 //
 //	adapter.SetClient(client)
 //	consumer, err := adapter.CreateConsumer(builder)
@@ -109,41 +105,34 @@ type Adapter struct {
 	allowRebalanceFn func()
 	commitRecordsFn  func(ctx context.Context, rs ...*kgo.Record) error
 	closeFn          func()
+
+	// poll-error handling: rate-limit repeated per-partition fetch-error logs
+	// and stop the consumer if a partition keeps failing. Keyed "topic-partition".
+	pollErrSince  map[string]time.Time // start of the current error streak
+	pollErrLogged map[string]time.Time // last time we logged that partition's error
+	pollErrLastID map[string]string    // identity of that last logged error (changed error logs immediately)
+	opts          adapterOptions       // poll-error tuning (defaults + validation in adapter_options.go)
+	bailOnce      sync.Once
 }
 
-// New creates a franz-go adapter configured for the given consumer group.
+// New creates a franz-go adapter for the given consumer group. The kgo.Client is
+// built lazily in CreateConsumer() (topic from the builder) with auto-commit
+// disabled, cooperative-sticky balancing, and the rebalance callbacks wired.
 //
-// This is the recommended constructor for most use cases. The kgo.Client
-// is created lazily in CreateConsumer() when the topic is known from the builder.
-//
-// The adapter will be configured with:
-//   - Consumer group membership
-//   - Disabled auto-commit (required by nexus.ConsumerBuilder implementations)
-//   - Cooperative sticky balancing (minimal disruption during rebalances)
-//   - Rebalance callbacks properly wired to the adapter
-//
-// The context is used for the initial connectivity check (Ping) during
-// CreateConsumer() and can be cancelled to abort connection.
-//
-// Topic name is provided via builder.WithTopicName(), not here.
-//
-// For SASL, TLS, or other custom kgo.Opt settings, use NewWithOptions().
+// ctx is used for the CreateConsumer() Ping and can be cancelled to abort it.
+// Topic comes from builder.WithTopicName(). For SASL/TLS, use NewWithOptions().
 func New(ctx context.Context, groupID string, brokers ...string) *Adapter {
 	return NewWithOptions(ctx, groupID, brokers)
 }
 
-// NewWithOptions creates a franz-go adapter with custom kgo.Opt configuration.
+// NewWithOptions creates an adapter with extra kgo.Opts (SASL, TLS, timeouts,
+// ...). The client is built lazily in CreateConsumer().
 //
-// Use this when you need SASL authentication, TLS, or other custom settings.
-// The kgo.Client is created lazily in CreateConsumer() when the topic is known.
-//
-// Options are applied after base configuration but before required options:
+// Your options apply after the base config but before the required ones:
 //   - You CAN override: Balancers, fetch settings, timeouts, SASL, TLS
 //   - You CANNOT override: DisableAutoCommit, BlockRebalanceOnPoll, rebalance callbacks
 //
-// Topic name is provided via builder.WithTopicName(), not here.
-//
-// Example with SASL/SCRAM authentication:
+// Topic comes from builder.WithTopicName(). Example with SASL/SCRAM:
 //
 //	adapter := franzadapter.NewWithOptions(ctx, "my-group",
 //	    []string{"broker:9093"},
@@ -151,6 +140,9 @@ func New(ctx context.Context, groupID string, brokers ...string) *Adapter {
 //	    kgo.DialTLSConfig(tlsConfig),
 //	)
 func NewWithOptions(ctx context.Context, groupID string, brokers []string, opts ...kgo.Opt) *Adapter {
+	if groupID == "" {
+		panic("franzadapter: New/NewWithOptions require a consumer group")
+	}
 	return &Adapter{
 		initCtx:         ctx,
 		groupID:         groupID,
@@ -158,6 +150,10 @@ func NewWithOptions(ctx context.Context, groupID string, brokers []string, opts 
 		userOpts:        opts,
 		pendingAssigned: make(map[string][]int32),
 		pendingRevoked:  make(map[string][]int32),
+		pollErrSince:    make(map[string]time.Time),
+		pollErrLogged:   make(map[string]time.Time),
+		pollErrLastID:   make(map[string]string),
+		opts:            defaultAdapterOptions(),
 	}
 }
 
@@ -174,13 +170,7 @@ func (a *Adapter) initClient() error {
 
 	clientOpts = append(clientOpts, a.userOpts...)
 
-	requiredOpts := []kgo.Opt{
-		kgo.DisableAutoCommit(),
-		kgo.BlockRebalanceOnPoll(),
-		kgo.OnPartitionsAssigned(a.OnAssigned),
-		kgo.OnPartitionsRevoked(a.OnRevoked),
-		kgo.OnPartitionsLost(a.OnLost),
-	}
+	requiredOpts := a.RequiredOpts()
 	if a.bwCollector != nil {
 		requiredOpts = append(requiredOpts, kgo.WithHooks(a))
 	}
@@ -204,12 +194,9 @@ func (a *Adapter) initClient() error {
 	return nil
 }
 
-// WithBandwidthInterval enables bandwidth telemetry collection at the given cadence.
-// The adapter will accumulate per-partition byte counters from franz-go hooks and
-// emit BandwidthMetrics packets via the callback registered by the framework.
-//
-// Valid range: 1s to 12h. Zero uses the default (1 minute).
-// Must be called before CreateConsumer().
+// WithBandwidthInterval enables bandwidth telemetry at the given cadence.
+// Valid range 1s to 12h; zero uses the default (1 minute). Must be called
+// before CreateConsumer().
 func (a *Adapter) WithBandwidthInterval(d time.Duration) *Adapter {
 	if err := nexus.ValidateBandwidthInterval(d); err != nil {
 		panic(fmt.Errorf("WithBandwidthInterval: %w", err))
@@ -218,41 +205,34 @@ func (a *Adapter) WithBandwidthInterval(d time.Duration) *Adapter {
 	return a
 }
 
-// NewCustom creates a franz-go adapter for use with a custom kgo.Client.
-//
-// This is for advanced use cases where you need kgo.Client configuration
-// beyond what New() provides (e.g., custom fetch settings, SASL auth,
-// TLS configuration).
+// NewCustom creates an adapter driven by a kgo.Client you build yourself, for
+// configuration beyond what New() exposes.
 //
 // # Two-Phase Setup Required
 //
-// Because franz-go requires rebalance callbacks at client creation time,
-// you must follow this sequence:
+// franz-go needs the rebalance callbacks at client creation time, so:
 //
 //  1. Call NewCustom() to create the adapter (without client)
-//  2. Create your kgo.Client with adapter.OnAssigned/OnRevoked/OnLost
+//  2. Build your kgo.Client, spreading adapter.RequiredOpts() into it
 //  3. Call adapter.SetClient(client) to complete setup
 //
-// # Required kgo.Client Options
-//
-// Your client MUST include these options for correct operation:
-//
-//	kgo.DisableAutoCommit()                      // required for nexus consumers
-//	kgo.BlockRebalanceOnPoll()                   // cooperative rebalancing
-//	kgo.OnPartitionsAssigned(adapter.OnAssigned) // rebalance handling
-//	kgo.OnPartitionsRevoked(adapter.OnRevoked)   // rebalance handling
-//	kgo.OnPartitionsLost(adapter.OnLost)         // rebalance handling
-//
-// # Recommended Options
-//
-//	kgo.Balancers(kgo.CooperativeStickyBalancer()) // minimal disruption
-//
-// See package documentation for a complete example.
+// The client must include adapter.RequiredOpts().
 func NewCustom() *Adapter {
 	return &Adapter{
 		pendingAssigned: make(map[string][]int32),
 		pendingRevoked:  make(map[string][]int32),
+		pollErrSince:    make(map[string]time.Time),
+		pollErrLogged:   make(map[string]time.Time),
+		pollErrLastID:   make(map[string]string),
+		opts:            defaultAdapterOptions(),
 	}
+}
+
+// WithOptions configures poll-error handling from the given options, folding
+// them over the defaults and validating. Must be called before CreateConsumer.
+func (a *Adapter) WithOptions(options ...AdapterOption) *Adapter {
+	a.opts = processAdapterOptions(options...)
+	return a
 }
 
 // SetClient attaches a kgo.Client to an adapter created with NewCustom.
@@ -271,18 +251,21 @@ func (a *Adapter) SetClient(client *kgo.Client) {
 	a.closeFn = client.Close
 }
 
-// CreateConsumer wires the builder to this adapter via Port-Binding Builder pattern.
-//
-// The builder carries application dependencies (processMessage, deadLetter, etc.).
-// This method injects the adapter as BrokerPort. Topic name is obtained from
-// builder.TopicName().
-//
-// For adapters created with New()/NewWithOptions(), this is where the kgo.Client
-// is actually created and connected (using the topic from the builder).
-//
-// Returns an error if client creation or connection fails.
-// Returns Consumer (not AdaptedConsumer) to hide adapter-internal methods
-// like TriggerRebalance from the host application.
+// RequiredOpts are applied automatically in New and NewWithOptions.
+// Custom clients create using NewCustom must also include these.
+func (a *Adapter) RequiredOpts() []kgo.Opt {
+	return []kgo.Opt{
+		kgo.DisableAutoCommit(),
+		kgo.BlockRebalanceOnPoll(),
+		kgo.OnPartitionsAssigned(a.OnAssigned),
+		kgo.OnPartitionsRevoked(a.OnRevoked),
+		kgo.OnPartitionsLost(a.OnLost),
+	}
+}
+
+// CreateConsumer wires the builder to this adapter and returns the consumer.
+// For New/NewWithOptions adapters it also creates and connects the kgo.Client
+// (topic from the builder), returning an error if that fails.
 func (a *Adapter) CreateConsumer(builder nexus.ConsumerBuilder[*kgo.Record]) (nexus.Consumer[*kgo.Record], error) {
 	a.topicName = builder.TopicName()
 	if a.bwCollector != nil {
