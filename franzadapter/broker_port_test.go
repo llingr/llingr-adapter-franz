@@ -274,28 +274,52 @@ func TestPoll_NilClient(t *testing.T) {
 	})
 }
 
-// --- Poll Tests with Mocks ---
+// --- Poll and fetch-loop tests with mocks ---
 
-func TestPoll_ReturnsMessage(t *testing.T) {
+// prepareFetchCtx wires the fetch-loop context so tests can drive fetchNext
+// directly, without the goroutine.
+func prepareFetchCtx(a *Adapter) {
+	if a.ctx != nil {
+		a.fetchCtx = a.ctx
+		return
+	}
+	a.fetchCtx = context.Background()
+}
+
+// stopFetchLoop cancels the fetch loop and waits for it to exit; the cleanup
+// pair for startFetchLoop in tests.
+func stopFetchLoop(a *Adapter) {
+	a.fetchCancel()
+	<-a.fetchLoopDone
+}
+
+func TestPoll_DeliversFetchedRecord(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
 
 	expectedRecord := &kgo.Record{
 		Key:       []byte("test-key"),
 		Value:     []byte("test-value"),
+		Topic:     testTopicName,
 		Partition: 3,
 		Offset:    42,
 	}
 
-	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+	delivered := false // fetch-goroutine only
+	adapter.pollRecordsFn = func(ctx context.Context, _ int) kgo.Fetches {
+		if delivered {
+			<-ctx.Done()
+			return kgo.NewErrFetch(ctx.Err())
+		}
+		delivered = true
 		return makeFetches(expectedRecord)
 	}
 	adapter.allowRebalanceFn = func() {}
+	adapter.startFetchLoop()
+	defer stopFetchLoop(adapter)
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	msg, ok, err := adapter.Poll(2 * time.Second)
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -306,58 +330,57 @@ func TestPoll_ReturnsMessage(t *testing.T) {
 	if msg != expectedRecord {
 		t.Error("expected message to be returned")
 	}
+
+	// no further records: the next Poll signals dispatch and times out empty
+	msg, ok, err = adapter.Poll(50 * time.Millisecond)
+	if err != nil || ok || msg != nil {
+		t.Fatalf("expected an empty poll after the only record, got msg=%v ok=%v err=%v", msg, ok, err)
+	}
 }
 
-func TestPoll_EmptyFetches(t *testing.T) {
+func TestFetchNext_EmptyFetches(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
+	prepareFetchCtx(adapter)
 
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return kgo.Fetches{}
 	}
-	adapter.allowRebalanceFn = func() {}
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	record, exit := adapter.fetchNext()
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if exit {
+		t.Error("an empty fetch must not exit the loop")
 	}
-	if ok {
-		t.Error("expected ok=false for empty fetches")
-	}
-	if msg != nil {
-		t.Error("expected nil message for empty fetches")
+	if record != nil {
+		t.Error("expected nil record for empty fetches")
 	}
 }
 
-func TestPoll_PartitionError(t *testing.T) {
+func TestFetchNext_PartitionError(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	logger := &capturingLogger{}
 	adapter.logger = logger
 	adapter.opts.pollErrorBailAfter = 0 // disable bail; just exercise the error handling
+	adapter.opts.pollErrorBackoff = 0   // not under test here; keep the call snappy
+	prepareFetchCtx(adapter)
 
 	expectedErr := errors.New("partition error")
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetchesWithError(0, expectedErr)
 	}
-	adapter.allowRebalanceFn = func() {}
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	record, exit := adapter.fetchNext()
 
-	// Partition errors are absorbed (logged, not returned) so the consumer's
-	// poll loop does not re-log them on every poll.
-	if err != nil {
-		t.Errorf("expected nil error (absorbed), got %v", err)
+	// Partition errors are absorbed (logged, not delivered) so they are not
+	// re-logged on every poll.
+	if exit {
+		t.Error("a partition error must not exit the loop")
 	}
-	if ok {
-		t.Error("expected ok=false")
-	}
-	if msg != nil {
-		t.Error("expected nil message")
+	if record != nil {
+		t.Error("expected nil record")
 	}
 	if !logger.errorCalled || !contains(logger.lastErrorMsg, "partition error") {
 		t.Errorf("expected the partition error to be logged, got %q", logger.lastErrorMsg)
@@ -380,32 +403,32 @@ func makeFetchesRecordAndError(rec *kgo.Record, errPartition int32, err error) k
 
 // A single failing partition must not starve healthy ones: a record fetched
 // alongside a partition error is still delivered.
-func TestPoll_DeliversRecordDespitePartitionError(t *testing.T) {
+func TestFetchNext_DeliversRecordDespitePartitionError(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
 	adapter.opts.pollErrorBailAfter = 0
-	adapter.allowRebalanceFn = func() {}
+	prepareFetchCtx(adapter)
 
 	rec := &kgo.Record{Key: []byte("k"), Value: []byte("v"), Topic: testTopicName, Partition: 0, Offset: 5}
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetchesRecordAndError(rec, 1, errors.New("partition 1 boom"))
 	}
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
-	if err != nil {
-		t.Errorf("expected nil error, got %v", err)
+	record, exit := adapter.fetchNext()
+	if exit {
+		t.Error("a partition error must not exit the loop")
 	}
-	if !ok || msg == nil {
+	if record == nil {
 		t.Fatal("expected the healthy-partition record to be delivered despite the partition-1 error")
 	}
-	if msg.Partition != 0 {
-		t.Errorf("expected record from partition 0, got %d", msg.Partition)
+	if record.Partition != 0 {
+		t.Errorf("expected record from partition 0, got %d", record.Partition)
 	}
 }
 
 // Repeated identical partition errors are logged at most once per log interval.
-func TestPoll_RateLimitsErrorLogs(t *testing.T) {
+func TestFetchNext_RateLimitsErrorLogs(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	logger := &capturingLogger{}
@@ -413,13 +436,13 @@ func TestPoll_RateLimitsErrorLogs(t *testing.T) {
 	adapter.opts.pollErrorLogInterval = time.Hour // effectively "log once"
 	adapter.opts.pollErrorBailAfter = 0
 	adapter.opts.pollErrorBackoff = 0 // not under test here; keep the loop snappy
-	adapter.allowRebalanceFn = func() {}
+	prepareFetchCtx(adapter)
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetchesWithError(0, errors.New("boom"))
 	}
 
 	for i := 0; i < 5; i++ {
-		_, _, _ = adapter.Poll(10 * time.Millisecond)
+		_, _ = adapter.fetchNext()
 	}
 
 	if logger.errorCount != 1 {
@@ -429,7 +452,7 @@ func TestPoll_RateLimitsErrorLogs(t *testing.T) {
 
 // A changed error on the same partition logs immediately, even inside the
 // rate-limit window: distinct failure modes are never hidden behind the throttle.
-func TestPoll_LogsImmediatelyOnChangedError(t *testing.T) {
+func TestFetchNext_LogsImmediatelyOnChangedError(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	logger := &capturingLogger{}
@@ -437,7 +460,7 @@ func TestPoll_LogsImmediatelyOnChangedError(t *testing.T) {
 	adapter.opts.pollErrorLogInterval = time.Hour // throttle hard so only a CHANGE can re-log
 	adapter.opts.pollErrorBailAfter = 0
 	adapter.opts.pollErrorBackoff = 0 // not under test here; keep the loop snappy
-	adapter.allowRebalanceFn = func() {}
+	prepareFetchCtx(adapter)
 
 	var call int
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
@@ -449,10 +472,10 @@ func TestPoll_LogsImmediatelyOnChangedError(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		_, _, _ = adapter.Poll(10 * time.Millisecond)
+		_, _ = adapter.fetchNext()
 	}
 
-	// A logged once (polls 1-2 throttled to 1), then B logged once on change = 2.
+	// A logged once (fetches 1-2 throttled to 1), then B logged once on change = 2.
 	if logger.errorCount != 2 {
 		t.Errorf("expected 2 logs (A once, then B on change), got %d", logger.errorCount)
 	}
@@ -465,7 +488,7 @@ func TestPoll_LogsImmediatelyOnChangedError(t *testing.T) {
 // loop does not spin); the backoff is set via the public option, honours the
 // specified amount, is context-aware (cancelled context returns promptly), and
 // is disablable with 0.
-func TestPoll_BacksOffOnBrokerError(t *testing.T) {
+func TestFetchNext_BacksOffOnBrokerError(t *testing.T) {
 	// newErrAdapter wires an adapter whose every poll returns a broker error and
 	// no record, with an explicit backoff (set directly to bypass clamping so
 	// exact test durations stand).
@@ -475,7 +498,7 @@ func TestPoll_BacksOffOnBrokerError(t *testing.T) {
 		a.logger = &capturingLogger{}
 		a.opts.pollErrorBackoff = backoff
 		a.opts.pollErrorBailAfter = 0
-		a.allowRebalanceFn = func() {}
+		prepareFetchCtx(a)
 		a.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 			return makeFetchesWithError(1, errors.New("boom"))
 		}
@@ -490,7 +513,7 @@ func TestPoll_BacksOffOnBrokerError(t *testing.T) {
 		var elapsedFor = map[time.Duration]time.Duration{}
 		for _, d := range []time.Duration{30 * time.Millisecond, 120 * time.Millisecond} {
 			start := time.Now()
-			_, _, _ = newErrAdapter(context.Background(), d).Poll(time.Millisecond)
+			_, _ = newErrAdapter(context.Background(), d).fetchNext()
 			elapsed := time.Since(start)
 			elapsedFor[d] = elapsed
 			if elapsed < d-10*time.Millisecond {
@@ -506,19 +529,19 @@ func TestPoll_BacksOffOnBrokerError(t *testing.T) {
 		}
 	})
 
-	t.Run("cancelled context skips the backoff", func(t *testing.T) {
+	t.Run("cancelled context returns promptly", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		start := time.Now()
-		_, _, _ = newErrAdapter(ctx, 5*time.Second).Poll(time.Millisecond)
+		_, _ = newErrAdapter(ctx, 5*time.Second).fetchNext()
 		if elapsed := time.Since(start); elapsed >= time.Second {
-			t.Errorf("expected the cancelled context to skip the backoff, took %s", elapsed)
+			t.Errorf("expected the cancelled context to return promptly, took %s", elapsed)
 		}
 	})
 
 	t.Run("zero backoff disables the pause", func(t *testing.T) {
 		start := time.Now()
-		_, _, _ = newErrAdapter(context.Background(), 0).Poll(time.Millisecond)
+		_, _ = newErrAdapter(context.Background(), 0).fetchNext()
 		if elapsed := time.Since(start); elapsed >= 100*time.Millisecond {
 			t.Errorf("expected no pause with backoff disabled, took %s", elapsed)
 		}
@@ -526,14 +549,15 @@ func TestPoll_BacksOffOnBrokerError(t *testing.T) {
 }
 
 // A partition that keeps failing past the bail-after window stops the consumer once.
-func TestPoll_BailsAfterSustainedError(t *testing.T) {
+func TestFetchNext_BailsAfterSustainedError(t *testing.T) {
 	mac := &mockAdaptedConsumer{ctx: context.Background(), logger: &mockLogger{}}
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
 	adapter.adaptedConsumer = mac
 	adapter.opts.pollErrorBailAfter = 20 * time.Millisecond
-	adapter.allowRebalanceFn = func() {}
+	adapter.opts.pollErrorBackoff = 0
+	prepareFetchCtx(adapter)
 	// Stub the process-termination action so the bail does not os.Exit the test
 	// binary; record that it fired.
 	var terminated atomic.Bool
@@ -542,9 +566,9 @@ func TestPoll_BailsAfterSustainedError(t *testing.T) {
 		return makeFetchesWithError(1, errors.New("persistent error"))
 	}
 
-	_, _, _ = adapter.Poll(10 * time.Millisecond) // starts the streak
-	time.Sleep(30 * time.Millisecond)             // exceed the bail threshold
-	_, _, _ = adapter.Poll(10 * time.Millisecond) // trips the bail
+	_, _ = adapter.fetchNext()        // starts the streak
+	time.Sleep(30 * time.Millisecond) // exceed the bail threshold
+	_, _ = adapter.fetchNext()        // trips the bail
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && !terminated.Load() {
@@ -562,7 +586,7 @@ func TestPoll_BailsAfterSustainedError(t *testing.T) {
 // healthy polls from OTHER partitions: kgo not fetching the bad partition on a
 // given poll is not recovery. Regression test: previously the streak reset
 // whenever the bad partition was merely absent from a poll's errors.
-func TestPoll_BailStreakSurvivesHealthyPolls(t *testing.T) {
+func TestFetchNext_BailStreakSurvivesHealthyPolls(t *testing.T) {
 	mac := &mockAdaptedConsumer{ctx: context.Background(), logger: &mockLogger{}}
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
@@ -570,7 +594,8 @@ func TestPoll_BailStreakSurvivesHealthyPolls(t *testing.T) {
 	adapter.adaptedConsumer = mac
 	adapter.opts.pollErrorBailAfter = 30 * time.Millisecond
 	adapter.opts.pollErrorLogInterval = time.Hour
-	adapter.allowRebalanceFn = func() {}
+	adapter.opts.pollErrorBackoff = 0
+	prepareFetchCtx(adapter)
 	var terminated atomic.Bool
 	adapter.opts.bailTerminate = func() { terminated.Store(true) }
 
@@ -585,7 +610,7 @@ func TestPoll_BailStreakSurvivesHealthyPolls(t *testing.T) {
 	}
 
 	for i := 0; i < 12; i++ {
-		_, _, _ = adapter.Poll(5 * time.Millisecond)
+		_, _ = adapter.fetchNext()
 		time.Sleep(8 * time.Millisecond)
 	}
 
@@ -598,40 +623,59 @@ func TestPoll_BailStreakSurvivesHealthyPolls(t *testing.T) {
 	}
 }
 
-func TestPoll_IgnoresTimeoutError(t *testing.T) {
+func TestFetchNext_IgnoresTimeoutError(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
+	prepareFetchCtx(adapter)
 
 	// context.DeadlineExceeded is ignored
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetchesWithError(0, context.DeadlineExceeded)
 	}
-	adapter.allowRebalanceFn = func() {}
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	record, exit := adapter.fetchNext()
 
-	if err != nil {
-		t.Errorf("timeout error should be ignored, got: %v", err)
+	if exit {
+		t.Error("a timeout error must not exit the loop")
 	}
-	if ok {
-		t.Error("expected ok=false")
-	}
-	if msg != nil {
-		t.Error("expected nil message")
+	if record != nil {
+		t.Error("expected nil record")
 	}
 }
 
-func TestPoll_ClientClosed(t *testing.T) {
+func TestFetchNext_ClientClosed(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
+	prepareFetchCtx(adapter)
 
 	// franz-go returns a special fetch when client is closed
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return kgo.NewErrFetch(kgo.ErrClientClosed)
 	}
+
+	record, exit := adapter.fetchNext()
+
+	if !exit {
+		t.Error("a closed client must exit the loop")
+	}
+	if record != nil {
+		t.Error("expected nil record")
+	}
+}
+
+// A closed client ends the fetch loop, which closes the delivery channel;
+// Poll reports it as an error to the engine.
+func TestPoll_ClientClosed(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	adapter.allowRebalanceFn = func() {}
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		return kgo.NewErrFetch(kgo.ErrClientClosed)
+	}
+	adapter.startFetchLoop()
+	<-adapter.fetchLoopDone // the loop exits on its own
 
 	msg, ok, err := adapter.Poll(100 * time.Millisecond)
 
@@ -646,28 +690,6 @@ func TestPoll_ClientClosed(t *testing.T) {
 	}
 	if msg != nil {
 		t.Error("expected nil message")
-	}
-}
-
-func TestPoll_CallsAllowRebalance(t *testing.T) {
-	adapter := NewCustom()
-	adapter.ctx = context.Background()
-	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
-
-	allowRebalanceCalled := false
-	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
-		return kgo.Fetches{}
-	}
-	adapter.allowRebalanceFn = func() {
-		allowRebalanceCalled = true
-	}
-
-	_, _, _ = adapter.Poll(100 * time.Millisecond)
-
-	if !allowRebalanceCalled {
-		t.Error("expected allowRebalanceFn to be called")
 	}
 }
 
@@ -703,14 +725,13 @@ func TestPoll_ProcessesPendingRebalances(t *testing.T) {
 // engine's offset tracking is keyed by partition alone, so delivering it would
 // cross-contaminate offsets between topics; the adapter must refuse the record
 // and stop the consumer instead of proceeding.
-func TestPoll_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
+func TestFetchNext_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	logger := &capturingLogger{}
 	adapter.logger = logger
 	adapter.topicName = "orders"
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
+	prepareFetchCtx(adapter)
 
 	consumer := &mockAdaptedConsumer{}
 	adapter.adaptedConsumer = consumer
@@ -720,18 +741,14 @@ func TestPoll_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetches(&kgo.Record{Key: []byte("k"), Topic: "payments", Partition: 0, Offset: 7})
 	}
-	adapter.allowRebalanceFn = func() {}
 
-	record, ok, err := adapter.Poll(100 * time.Millisecond)
+	record, exit := adapter.fetchNext()
 
-	if err == nil {
-		t.Fatal("a foreign-topic record must surface an error")
-	}
-	if !contains(err.Error(), "payments") || !contains(err.Error(), "orders") {
-		t.Errorf("error should name both topics, got: %v", err)
-	}
-	if ok || record != nil {
+	if record != nil {
 		t.Error("the foreign-topic record must not be delivered to the engine")
+	}
+	if !exit {
+		t.Error("the fetch loop must exit after refusing a foreign-topic record")
 	}
 	// synchronize with the bail goroutine BEFORE reading the logger: its own
 	// error logs race an earlier read, and terminate() is its final act
@@ -742,6 +759,15 @@ func TestPoll_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 	}
 	if !logger.errorCalled {
 		t.Error("expected the misconfiguration to be logged as an error")
+	}
+	var namedBoth bool
+	for _, msg := range logger.errorMsgs {
+		if contains(msg, "payments") && contains(msg, "orders") {
+			namedBoth = true
+		}
+	}
+	if !namedBoth {
+		t.Errorf("the log should name both topics, got: %v", logger.errorMsgs)
 	}
 	if !consumer.shutdownCalled.Load() {
 		t.Error("expected Shutdown to be attempted before termination")
@@ -768,32 +794,38 @@ func (c *failingOnceAdaptedConsumer) TriggerRebalance(rebalanceType nexus.Rebala
 }
 
 // Poll must not lose a fetched record when the assign trigger fails: the
-// client has already consumed it, so dropping it on the error path is an
-// at-least-once violation. Unreachable today (the trigger cannot fail for
-// this adapter) but latent. The pending assign must survive the failure too,
-// so the next poll retries it before delivering the stashed record.
+// fetch loop has already consumed it from the client, so dropping it on the
+// error path is an at-least-once violation. Unreachable today (the trigger
+// cannot fail for this adapter) but latent. The pending assign must survive
+// the failure too, so the next poll retries it before delivering the stashed
+// record. Throughout the episode the dispatch signal must NOT be sent (the
+// rebalance gate stays closed until the stash is returned and dispatched).
 func TestPoll_StashesRecordWhenAssignTriggerFails(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
 	adapter.pendingAssigned = map[string][]int32{testTopicName: {0}}
 	adapter.pendingRevoked = make(map[string][]int32)
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches { return kgo.Fetches{} }
 
 	consumer := &failingOnceAdaptedConsumer{}
 	adapter.adaptedConsumer = consumer
 
 	record := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 7}
-	fetched := false
-	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
-		if fetched {
-			return kgo.Fetches{}
-		}
-		fetched = true
-		return makeFetches(record)
-	}
-	adapter.allowRebalanceFn = func() {}
 
-	// first poll: the record is fetched, then the assign trigger fails
+	// Stand-in for the fetch loop: deliver one record, then absorb the
+	// dispatch signal the way runFetchLoop does.
+	adapter.fetchedRecords = make(chan *kgo.Record)
+	adapter.recordDispatched = make(chan struct{})
+	adapter.fetchLoopDone = make(chan struct{})
+	dispatchSignalled := make(chan struct{})
+	go func() {
+		adapter.fetchedRecords <- record
+		<-adapter.recordDispatched
+		close(dispatchSignalled)
+	}()
+
+	// first poll: the record arrives, then the assign trigger fails
 	msg, ok, err := adapter.Poll(100 * time.Millisecond)
 	if err == nil {
 		t.Fatal("first Poll should surface the assign trigger failure")
@@ -802,7 +834,8 @@ func TestPoll_StashesRecordWhenAssignTriggerFails(t *testing.T) {
 		t.Fatalf("first Poll must not deliver during the failure: ok=%v msg=%v", ok, msg)
 	}
 
-	// subsequent polls: the assign retries, then the stashed record arrives
+	// subsequent polls: the assign retries, then the stashed record arrives;
+	// the poll after that signals dispatch and times out empty
 	var delivered []*kgo.Record
 	for i := 0; i < 3; i++ {
 		msg, ok, err := adapter.Poll(100 * time.Millisecond)
@@ -820,59 +853,134 @@ func TestPoll_StashesRecordWhenAssignTriggerFails(t *testing.T) {
 	if consumer.assignCalls != 2 {
 		t.Errorf("assign trigger calls = %d, want 2 (fail, then retry)", consumer.assignCalls)
 	}
+	select {
+	case <-dispatchSignalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("dispatch must be signalled by the poll after the stash was returned")
+	}
 }
 
-// --- AllowRebalance ordering (duplicate-window regression) ---
+// --- Gate protocol (duplicate-window regression) ---
 
-// AllowRebalance must be called at the TOP of Poll, before the fetch, never
-// between the fetch and record delivery. Releasing franz-go's rebalance gate
-// after PollRecords but before the record reaches the engine opens a window
-// where a cooperative revoke (running on franz-go's callback goroutine) drains
-// and commits while the in-hand record is still being dispatched to a worker:
-// the record is processed but never committed (orphaned work), and the partition's
-// next owner re-reads it (duplicates). Releasing the gate at the top instead
-// means a rebalance can only begin between Poll calls, after the polling loop
-// has fully dispatched the previous record, so the revoke drain always sees it.
-func TestPoll_AllowRebalancePrecedesFetch(t *testing.T) {
+// The fetch loop must hold franz-go's rebalance gate (its poller registration)
+// from fetch-return until the engine has FULLY dispatched the record: it calls
+// AllowRebalance only after the next Poll signals dispatch, and it must not
+// fetch again before that. Releasing earlier reopens the handoff window where
+// a cooperative revoke (on franz-go's callback goroutine) drains and commits
+// while the record is still being dispatched to a worker: the record's work is
+// never committed (orphaned), and the partition's next owner re-reads it
+// (duplicates).
+func TestFetchLoop_ReleasesGateOnlyAfterNextPoll(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
 
-	var calls []string
-	adapter.allowRebalanceFn = func() { calls = append(calls, "allow") }
-	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
-		calls = append(calls, "fetch")
-		return makeFetches(&kgo.Record{
-			Key:       []byte("k"),
-			Topic:     testTopicName,
-			Partition: 0,
-			Offset:    int64(len(calls)),
-		})
+	var allows, fetchCalls atomic.Int32
+	adapter.allowRebalanceFn = func() { allows.Add(1) }
+	record := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 7}
+	adapter.pollRecordsFn = func(ctx context.Context, _ int) kgo.Fetches {
+		if fetchCalls.Add(1) > 1 {
+			<-ctx.Done()
+			return kgo.NewErrFetch(ctx.Err())
+		}
+		return makeFetches(record)
+	}
+	adapter.startFetchLoop()
+	defer stopFetchLoop(adapter)
+
+	msg, ok, err := adapter.Poll(2 * time.Second)
+	if err != nil || !ok || msg != record {
+		t.Fatalf("expected the record, got msg=%v ok=%v err=%v", msg, ok, err)
 	}
 
-	for i := 0; i < 2; i++ {
-		if _, ok, err := adapter.Poll(100 * time.Millisecond); err != nil || !ok {
-			t.Fatalf("poll %d: ok=%v err=%v", i, ok, err)
-		}
+	// The record is returned but its dispatch is not yet signalled: the fetch
+	// loop is parked on recordDispatched, so the gate MUST still be closed and
+	// no new fetch may have started.
+	if got := allows.Load(); got != 0 {
+		t.Fatalf("gate released before dispatch was signalled (AllowRebalance calls = %d)", got)
+	}
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("fetch loop re-entered the client before dispatch was signalled (fetches = %d)", got)
 	}
 
-	want := []string{"allow", "fetch", "allow", "fetch"}
-	if len(calls) != len(want) {
-		t.Fatalf("calls = %v, want %v", calls, want)
+	// The next Poll is the dispatch signal: the gate opens, fetching resumes.
+	if _, ok, err := adapter.Poll(50 * time.Millisecond); err != nil || ok {
+		t.Fatalf("expected an empty poll, got ok=%v err=%v", ok, err)
 	}
-	for i := range want {
-		if calls[i] != want[i] {
-			t.Fatalf("call order = %v, want %v (the gate must be released before the fetch so the previous record is dispatched before any rebalance can start)", calls, want)
-		}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && (allows.Load() < 1 || fetchCalls.Load() < 2) {
+		time.Sleep(time.Millisecond)
+	}
+	if allows.Load() != 1 || fetchCalls.Load() != 2 {
+		t.Fatalf("after dispatch: AllowRebalance calls = %d (want 1), fetches = %d (want 2)",
+			allows.Load(), fetchCalls.Load())
 	}
 }
 
-func TestPoll_MultipleRecords_ReturnsFirst(t *testing.T) {
+// Exit paths can leave a poller registration held inside franz-go (a cancelled
+// or closed poll registers one before returning its fake fetch, and a record
+// dropped on the way out still holds the one from its fetch), so the loop must
+// open the gate on the way out or the client's leave-group rebalance would
+// deadlock on it.
+func TestFetchLoop_ReleasesGateOnExit(t *testing.T) {
+	t.Run("cancelled while waiting for data", func(t *testing.T) {
+		adapter := NewCustom()
+		adapter.ctx = context.Background()
+		adapter.logger = &capturingLogger{}
+		var allows atomic.Int32
+		adapter.allowRebalanceFn = func() { allows.Add(1) }
+		adapter.pollRecordsFn = func(ctx context.Context, _ int) kgo.Fetches {
+			<-ctx.Done()
+			return kgo.NewErrFetch(ctx.Err())
+		}
+		adapter.startFetchLoop()
+
+		stopFetchLoop(adapter)
+
+		if allows.Load() != 1 {
+			t.Fatalf("expected the exit to release the gate once, AllowRebalance calls = %d", allows.Load())
+		}
+	})
+
+	t.Run("cancelled with an undelivered record in hand", func(t *testing.T) {
+		adapter := NewCustom()
+		adapter.ctx = context.Background()
+		adapter.logger = &capturingLogger{}
+		var allows, fetchCalls atomic.Int32
+		adapter.allowRebalanceFn = func() { allows.Add(1) }
+		record := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 7}
+		adapter.pollRecordsFn = func(ctx context.Context, _ int) kgo.Fetches {
+			if fetchCalls.Add(1) > 1 {
+				<-ctx.Done()
+				return kgo.NewErrFetch(ctx.Err())
+			}
+			return makeFetches(record)
+		}
+		adapter.startFetchLoop()
+
+		// wait until the record is fetched (the loop then blocks on delivery,
+		// which no one services), then stop
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) && fetchCalls.Load() == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		stopFetchLoop(adapter)
+
+		if allows.Load() != 1 {
+			t.Fatalf("expected the exit to release the gate once, AllowRebalance calls = %d", allows.Load())
+		}
+		// the dropped record was never delivered; Poll reports the closed loop
+		if _, _, err := adapter.Poll(10 * time.Millisecond); err == nil || !contains(err.Error(), "client closed") {
+			t.Fatalf("expected 'client closed' after the loop exit, got: %v", err)
+		}
+	})
+}
+
+func TestFetchNext_MultipleRecords_TakesFirst(t *testing.T) {
 	adapter := NewCustom()
 	adapter.ctx = context.Background()
 	adapter.logger = &capturingLogger{}
-	adapter.pendingAssigned = make(map[string][]int32)
-	adapter.pendingRevoked = make(map[string][]int32)
+	prepareFetchCtx(adapter)
 
 	firstRecord := &kgo.Record{
 		Key:       []byte("first"),
@@ -888,17 +996,13 @@ func TestPoll_MultipleRecords_ReturnsFirst(t *testing.T) {
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetches(firstRecord, secondRecord)
 	}
-	adapter.allowRebalanceFn = func() {}
 
-	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	record, exit := adapter.fetchNext()
 
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	if exit {
+		t.Error("records must not exit the loop")
 	}
-	if !ok {
-		t.Error("expected ok=true")
-	}
-	if msg != firstRecord {
+	if record != firstRecord {
 		t.Error("expected first record to be returned")
 	}
 }
@@ -1107,7 +1211,9 @@ type capturingLogger struct {
 	errorCalled  bool
 	errorCount   int
 	lastInfoMsg  string
+	lastWarnMsg  string
 	lastErrorMsg string
+	errorMsgs    []string
 }
 
 func (l *capturingLogger) Debug(_ context.Context, _ string, _ ...any) {
@@ -1119,14 +1225,16 @@ func (l *capturingLogger) Info(_ context.Context, format string, _ ...any) {
 	l.lastInfoMsg = format
 }
 
-func (l *capturingLogger) Warn(_ context.Context, _ string, _ ...any) {
+func (l *capturingLogger) Warn(_ context.Context, format string, _ ...any) {
 	l.warnCalled = true
+	l.lastWarnMsg = format
 }
 
 func (l *capturingLogger) Error(_ context.Context, format string, _ ...any) {
 	l.errorCalled = true
 	l.errorCount++
 	l.lastErrorMsg = format
+	l.errorMsgs = append(l.errorMsgs, format)
 }
 
 // TestConsumerGroup covers the trivial-but-uncovered ConsumerGroup() getter.
@@ -1163,5 +1271,104 @@ func TestUnsubscribe_WithBandwidthCollector(t *testing.T) {
 
 	if err := a.Unsubscribe(); err != nil {
 		t.Errorf("Unsubscribe returned error: %v", err)
+	}
+}
+
+// Unsubscribe must leave the group explicitly BEFORE closing, and surface the
+// outcome: the client's own close-path leave swallows a failed LeaveGroup
+// request, whose only symptom is the coordinator expiring the member a full
+// session timeout later.
+func TestUnsubscribe_LeavesGroupBeforeClose(t *testing.T) {
+	t.Run("successful leave is logged and precedes close", func(t *testing.T) {
+		logger := &capturingLogger{}
+		var calls []string
+		adapter := &Adapter{
+			ctx:    context.Background(),
+			logger: logger,
+			leaveGroupFn: func(_ context.Context) error {
+				calls = append(calls, "leave")
+				return nil
+			},
+			closeFn: func() { calls = append(calls, "close") },
+		}
+
+		if err := adapter.Unsubscribe(); err != nil {
+			t.Fatalf("Unsubscribe returned error: %v", err)
+		}
+		if len(calls) != 2 || calls[0] != "leave" || calls[1] != "close" {
+			t.Fatalf("call order = %v, want [leave close]", calls)
+		}
+		if !contains(logger.lastInfoMsg, "client closed") {
+			t.Errorf("expected the close bracket to finish, last info = %q", logger.lastInfoMsg)
+		}
+	})
+
+	t.Run("failed leave is surfaced and close still runs", func(t *testing.T) {
+		logger := &capturingLogger{}
+		closed := false
+		adapter := &Adapter{
+			ctx:    context.Background(),
+			logger: logger,
+			leaveGroupFn: func(_ context.Context) error {
+				return errors.New("coordinator moved")
+			},
+			closeFn: func() { closed = true },
+		}
+
+		if err := adapter.Unsubscribe(); err != nil {
+			t.Fatalf("Unsubscribe returned error: %v", err)
+		}
+		if !closed {
+			t.Fatal("a failed leave must not prevent the close")
+		}
+		if !logger.warnCalled || !contains(logger.lastWarnMsg, "leave group FAILED") ||
+			!contains(logger.lastWarnMsg, "coordinator moved") {
+			t.Fatalf("expected the leave failure surfaced with its cause, got %q", logger.lastWarnMsg)
+		}
+	})
+}
+
+// TestSubscribeUnsubscribe_FetchLoopLifecycle: Subscribe starts the fetch
+// goroutine (the group joins on its first poll); Unsubscribe stops it and
+// waits for its exit BEFORE closing the client, so the loop's deferred
+// AllowRebalance has run when the close triggers the final leave-group
+// rebalance.
+func TestSubscribeUnsubscribe_FetchLoopLifecycle(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+
+	polled := make(chan struct{})
+	var polledOnce atomic.Bool
+	adapter.pollRecordsFn = func(ctx context.Context, _ int) kgo.Fetches {
+		if polledOnce.CompareAndSwap(false, true) {
+			close(polled)
+		}
+		<-ctx.Done()
+		return kgo.NewErrFetch(ctx.Err())
+	}
+	adapter.allowRebalanceFn = func() {}
+	var closeCalled atomic.Bool
+	adapter.closeFn = func() { closeCalled.Store(true) }
+
+	if err := adapter.Subscribe(); err != nil {
+		t.Fatalf("Subscribe returned error: %v", err)
+	}
+	select {
+	case <-polled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Subscribe should start the fetch loop")
+	}
+
+	if err := adapter.Unsubscribe(); err != nil {
+		t.Fatalf("Unsubscribe returned error: %v", err)
+	}
+	select {
+	case <-adapter.fetchLoopDone:
+	default:
+		t.Fatal("Unsubscribe must stop the fetch loop before closing the client")
+	}
+	if !closeCalled.Load() {
+		t.Fatal("Unsubscribe should close the client after the loop stops")
 	}
 }

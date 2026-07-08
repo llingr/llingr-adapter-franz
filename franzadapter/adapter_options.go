@@ -6,6 +6,8 @@ package franzadapter
 import (
 	"os"
 	"time"
+
+	"github.com/twmb/franz-go/pkg/kgo"
 )
 
 // adapterOptions is the resolved poll-error handling configuration, set through
@@ -35,6 +37,13 @@ type adapterOptions struct {
 	// batched across partitions), so the consumer starts from a real baseline
 	// instead of the -1 unknown sentinel. Enabled by default.
 	assignmentOffsetLookup bool
+
+	// clientLogLevel is the verbosity of franz-go's internal diagnostics,
+	// bridged into the consumer's logger. Info (the default) surfaces group
+	// lifecycle: joins, leaves and their failures, rebalance rounds. Debug
+	// adds per-request client internals (very chatty); None disables the
+	// bridge output entirely.
+	clientLogLevel kgo.LogLevel
 }
 
 // Poll-error handling defaults and bounds.
@@ -53,6 +62,23 @@ const (
 	// coordinator can be mid-move during exactly the churn that produces
 	// assigns, so the lookup must never stall the poll loop for long.
 	assignmentOffsetLookupTimeout = 5 * time.Second
+
+	// fetchLoopStopTimeout bounds Unsubscribe's wait for the fetch goroutine
+	// to exit after cancellation. The loop's exit is prompt everywhere except
+	// when it is parked behind an in-flight rebalance inside the client (an
+	// untimed wait, bounded in practice by the group's rebalance timeout);
+	// past this bound the close proceeds anyway, and CloseAllowingRebalance
+	// force-opens the rebalance gate so the late exit cannot deadlock it.
+	fetchLoopStopTimeout = 10 * time.Second
+
+	// leaveGroupTimeout bounds Unsubscribe's wait for the explicit LeaveGroup
+	// (which includes the client running the final revoke callback). On
+	// expiry the leave continues in the background and the close - which
+	// waits for it regardless - proceeds; the bound exists so a slow or
+	// failed leave is LOGGED rather than silent, since an unregistered leave
+	// means the broker evicts the member only at session timeout, freezing
+	// its partitions until then.
+	leaveGroupTimeout = 5 * time.Second
 )
 
 // defaultBailTerminate ends the process after a bail.
@@ -95,6 +121,19 @@ func WithBailTerminate(fn func()) AdapterOption {
 	}
 }
 
+// WithClientLogLevel sets the verbosity of franz-go's internal diagnostics,
+// which the adapter bridges into the consumer's logger (prefixed "franz-go:").
+// The default, kgo.LogLevelInfo, surfaces the group lifecycle: joins, leaves
+// and their failures, rebalance rounds. kgo.LogLevelDebug adds per-request
+// client internals (very chatty; for diagnostic runs). kgo.LogLevelNone
+// silences the bridge. Applies to clients built by the adapter (New,
+// NewWithOptions); a NewCustom client configures kgo.WithLogger itself.
+func WithClientLogLevel(level kgo.LogLevel) AdapterOption {
+	return func(o *adapterOptions) {
+		o.clientLogLevel = level
+	}
+}
+
 // WithAssignmentOffsetLookup enables or disables the committed-offset query on
 // partition assignment (default: enabled). When enabled, the adapter spends
 // one coordinator round trip per assign event (batched across partitions) to
@@ -116,6 +155,7 @@ func defaultAdapterOptions() adapterOptions {
 		pollErrorBackoff:       defaultPollErrorBackoff,
 		bailTerminate:          defaultBailTerminate,
 		assignmentOffsetLookup: true,
+		clientLogLevel:         kgo.LogLevelInfo,
 	}
 }
 

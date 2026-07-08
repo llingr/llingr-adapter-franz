@@ -21,41 +21,129 @@ import (
 var _ nexus.BrokerPort[*kgo.Record] = (*Adapter)(nil)
 var _ nexus.BandwidthPort[*kgo.Record] = (*Adapter)(nil)
 
-// Subscribe to topic. With franz-go, topic subscription is typically done
-// at client creation via kgo.ConsumeTopics(), so this validates readiness.
-// Topic name is provided at adapter construction, not here.
+// Subscribe starts the dedicated fetch goroutine. Topic subscription itself is
+// done at client creation via kgo.ConsumeTopics(); the group is joined when
+// the fetch loop issues its first poll.
 func (a *Adapter) Subscribe() error {
+	if a.pollRecordsFn != nil {
+		a.fetchStart.Do(a.startFetchLoop)
+	}
 	a.logger.Info(a.ctx, fmt.Sprintf("franz-go subscribed to topic: %s", a.topicName))
 	return nil
 }
 
-// Unsubscribe and close the client.
+// startFetchLoop wires the fetch-loop plumbing and launches the goroutine.
+// Called once, from Subscribe.
+func (a *Adapter) startFetchLoop() {
+	base := a.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	a.fetchCtx, a.fetchCancel = context.WithCancel(base)
+	a.fetchedRecords = make(chan *kgo.Record)
+	a.recordDispatched = make(chan struct{})
+	a.fetchLoopDone = make(chan struct{})
+	go a.runFetchLoop()
+}
+
+// Unsubscribe stops the fetch loop, then closes the client. Stopping first
+// means the loop's deferred AllowRebalance has normally run before the close
+// triggers the final leave-group rebalance; if the loop is parked behind an
+// in-flight rebalance inside the client past the bounded wait, the close
+// proceeds anyway (see fetchLoopStopTimeout).
 func (a *Adapter) Unsubscribe() error {
 	if a.bwCollector != nil {
 		a.bwCollector.stop()
 	}
+	if a.fetchCancel != nil {
+		a.fetchCancel()
+		select {
+		case <-a.fetchLoopDone:
+			if a.logger != nil {
+				a.logger.Info(a.ctx, "unsubscribe: fetch loop stopped")
+			}
+		case <-time.After(fetchLoopStopTimeout):
+			a.logger.Warn(a.ctx, fmt.Sprintf(
+				"fetch loop did not stop within %s (parked behind an in-flight rebalance); closing anyway",
+				fetchLoopStopTimeout))
+		}
+	}
+	// Leave the group explicitly, with the error SURFACED: the client's own
+	// close-path leave swallows a failed LeaveGroup request, and the first
+	// visible symptom of that is the coordinator expiring this member a full
+	// session timeout later, its partitions frozen until then. The wait is
+	// bounded for visibility only; a leave still in flight completes in the
+	// background and the close below waits for it regardless. Deliberately
+	// NOT on a.ctx, which may already be cancelled during shutdown. Ordering:
+	// after the fetch-loop stop, because the leave needs the rebalance gate
+	// (and if the loop failed to stop, the close's force-open still unblocks
+	// it, bounded by leaveGroupTimeout here).
+	if a.leaveGroupFn != nil {
+		leaveCtx, cancel := context.WithTimeout(context.Background(), leaveGroupTimeout)
+		started := time.Now()
+		err := a.leaveGroupFn(leaveCtx)
+		cancel()
+		switch {
+		case err == nil:
+			if a.logger != nil {
+				a.logger.Info(a.ctx, fmt.Sprintf("unsubscribe: left consumer group in %s",
+					time.Since(started).Round(time.Millisecond)))
+			}
+		case errors.Is(err, context.DeadlineExceeded):
+			a.logger.Warn(a.ctx, fmt.Sprintf(
+				"unsubscribe: leave group still in flight after %s (close will wait for it)", leaveGroupTimeout))
+		default:
+			a.logger.Warn(a.ctx, fmt.Sprintf(
+				"unsubscribe: leave group FAILED: %v - the broker will only evict this member at "+
+					"session timeout, and its partitions stay unassigned until then", err))
+		}
+	}
 	if a.closeFn != nil {
+		// Close leaves the consumer group and can block behind an in-flight
+		// rebalance; bracket it so a shutdown wedged here names this step.
+		started := time.Now()
+		if a.logger != nil {
+			a.logger.Info(a.ctx, "unsubscribe: closing client")
+		}
 		a.closeFn()
+		if a.logger != nil {
+			a.logger.Info(a.ctx, fmt.Sprintf("unsubscribe: client closed in %s",
+				time.Since(started).Round(time.Millisecond)))
+		}
 	}
 	return nil
 }
 
-// Poll fetches the next record from franz-go.
+// Poll returns the next record delivered by the fetch loop, waiting at most
+// timeout. It never touches the client, so it can never park inside franz-go's
+// untimed poll/rebalance exclusion wait: the polling loop stays responsive to
+// the engine's stop and pause signals for the whole duration of any rebalance,
+// matching the confluent adapter, whose rebalance callbacks run inline on the
+// polling thread.
 //
-// Uses the BlockRebalanceOnPoll pattern with the gate released at the TOP of
-// each Poll, before the fetch: a rebalance may begin only between Poll calls,
-// i.e. only after the record returned by the previous Poll has been dispatched
-// into the pipeline by the polling loop. The gate is never released while a
-// record is in hand but undelivered, so a revoke's drain always sees every
-// delivered record.
+// Gate protocol, engine side: returning a record sets recordAwaitingDispatch;
+// the NEXT Poll call is proof that the polling loop has fully dispatched that
+// record into the pipeline (it dispatches synchronously before polling again),
+// so it signals recordDispatched, and only then does the fetch loop release
+// franz-go's rebalance gate. A rebalance can therefore only begin between
+// records, so a revoke's drain always sees every record Poll has returned.
 func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 	if a.pollRecordsFn == nil {
 		return nil, false, fmt.Errorf("client closed")
 	}
 
+	if a.recordAwaitingDispatch {
+		a.recordAwaitingDispatch = false
+		select {
+		case a.recordDispatched <- struct{}{}:
+		case <-a.fetchLoopDone:
+		}
+	}
+
 	// A record stashed by a previous poll's failed assign trigger takes
-	// precedence over fetching. The rebalance gate stays closed: the record is
-	// in hand and undelivered (see the gate invariant below).
+	// precedence over the channel. The rebalance gate is still closed: the
+	// fetch loop releases it only on the dispatch signal, which is not sent
+	// until the stash has been returned and dispatched.
 	if a.pendingRecord != nil {
 		record := a.pendingRecord
 		a.pendingRecord = nil
@@ -63,32 +151,97 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 			a.pendingRecord = record
 			return nil, false, err
 		}
+		a.recordAwaitingDispatch = true
 		return record, true, nil
 	}
 
-	// Release the rebalance gate BEFORE fetching, not after. By the time this
-	// call runs, the record returned by the previous Poll has been fully
-	// dispatched into the pipeline (the polling loop dispatches synchronously
-	// before polling again), so a revoke that starts now is drained AFTER that
-	// record is visible to the drain. The old order (release after PollRecords,
-	// before returning the record) opened the gate while this call's record was
-	// still in hand and undelivered: a cooperative revoke could drain and commit
-	// without it, the record's work was never committed, and the partition's
-	// next owner re-read it (duplicates). franz-go semantics: a poll that
-	// returned records keeps its poller registered (blocking rebalances) until
-	// AllowRebalance; an empty poll self-releases its poller, so an idle
-	// consumer never blocks a rebalance.
-	if a.allowRebalanceFn != nil {
-		a.allowRebalanceFn()
+	var record *kgo.Record
+	var loopExited bool
+	// Fast path first: skip the timer when a record is already waiting.
+	select {
+	case r, ok := <-a.fetchedRecords:
+		record, loopExited = r, !ok
+	default:
+		select {
+		case r, ok := <-a.fetchedRecords:
+			record, loopExited = r, !ok
+		case <-time.After(timeout):
+		}
+	}
+	if loopExited {
+		return nil, false, fmt.Errorf("client closed")
 	}
 
-	ctx, cancel := context.WithTimeout(a.ctx, timeout)
-	defer cancel()
+	if err := a.processPendingRebalances(); err != nil {
+		// the fetch loop already consumed this record from the client: stash it
+		// for the next poll rather than lose it (at-least-once)
+		a.pendingRecord = record
+		return nil, false, err
+	}
 
-	fetches := a.pollRecordsFn(ctx, 1)
+	if record != nil {
+		a.recordAwaitingDispatch = true
+		return record, true, nil
+	}
+	return nil, false, nil
+}
 
-	if fetches.IsClientClosed() {
-		return nil, false, fmt.Errorf("client closed")
+// runFetchLoop is the dedicated fetch goroutine: the only caller of
+// PollRecords and AllowRebalance, and the only goroutine permitted to park
+// inside the client (which a poll does, untimed, whenever a rebalance is in
+// progress - harmless here because nothing waits on this goroutine's return).
+// See the gate protocol on the Adapter fields for why AllowRebalance runs only
+// after the dispatch signal.
+func (a *Adapter) runFetchLoop() {
+	defer close(a.fetchLoopDone)
+	defer close(a.fetchedRecords)
+	// Whatever state the loop exits in, open the rebalance gate: a poller
+	// registration may be held by a delivered-but-undispatched record, by a
+	// record dropped on the way out, or by the fake fetch a cancelled or
+	// closed poll returns (franz-go registers a poller even for those).
+	defer a.allowRebalanceFn()
+
+	for {
+		record, exit := a.fetchNext()
+		switch {
+		case exit:
+			return
+		case record == nil:
+			// Empty poll: franz-go self-released its poller registration, so
+			// no gate is held and there is nothing to deliver.
+			continue
+		}
+
+		select {
+		case a.fetchedRecords <- record:
+		case <-a.fetchCtx.Done():
+			// Stopping with a record in hand: drop it. It was never delivered,
+			// so its offset was never committed; the partition's next owner
+			// re-reads it (at-least-once).
+			return
+		}
+
+		select {
+		case <-a.recordDispatched:
+		case <-a.fetchCtx.Done():
+			return
+		}
+
+		// The engine called Poll again, so the record above is fully
+		// dispatched into the pipeline: a revoke that begins now sees it.
+		a.allowRebalanceFn()
+	}
+}
+
+// fetchNext performs one poll against the client. The context carries no
+// per-call timeout: the call parks until data, a rebalance, cancellation, or
+// close, and only the fetch goroutine may park there. Returns the fetched
+// record (nil when the poll produced none) and whether the loop must exit.
+func (a *Adapter) fetchNext() (*kgo.Record, bool) {
+	fetches := a.pollRecordsFn(a.fetchCtx, 1)
+
+	if fetches.IsClientClosed() || a.fetchCtx.Err() != nil {
+		return nil, true
 	}
 
 	// Deliver a record from a healthy partition first; a single failing
@@ -100,13 +253,6 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		}
 	})
 
-	if err := a.processPendingRebalances(); err != nil {
-		// the client already consumed this fetch's record: stash it for the
-		// next poll rather than lose it (at-least-once)
-		a.pendingRecord = record
-		return nil, false, err
-	}
-
 	// Single-topic contract: the engine's offset tracking is keyed by partition
 	// alone, so a record from another topic (a multi-topic or pattern
 	// subscription slipped in via NewCustom) would cross-contaminate committed
@@ -117,38 +263,36 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 			record.Topic, a.topicName)
 		a.logger.Error(a.ctx, err.Error())
 		a.bail(err)
-		return nil, false, err
+		return nil, true // never deliver the foreign record; the bail shuts the consumer down
 	}
 
 	// Rate-limit-log per-partition fetch errors and bail if one persists.
-	// Errors are absorbed (not returned) so the consumer's poll loop does not
-	// re-log them on every poll.
+	// Errors are absorbed (not delivered) so they are not re-logged every poll.
 	sawErr := a.handlePollErrors(fetches)
 
-	if record != nil {
-		// DIAGNOSTIC TRACE COMMENTED OUT (not removed) for the mutex-vs-coincidence
-		// experiment. This call takes a.mu on the per-record delivery path; that added
-		// synchronization (with the arming in triggerAssign) is the suspected reason the
-		// residual franz handoff duplicate stopped reproducing. We re-run the yoyo several
-		// times WITHOUT it to measure the real reproduction rate. It stays here, commented,
-		// so the offset-level handoff logging can be re-enabled to diagnose the residual
-		// once we have confirmed it is real rather than a timing artefact of this lock.
-		// Note a.mu is still taken by OnAssigned/processPendingRebalances (pre-trace); only
-		// the per-record delivery lock is removed, which is exactly the variable under test.
-		// a.traceFirstReadAfterAssign(record)
-		return record, true, nil
-	}
-
-	// Broker error with no record: back off briefly so the loop does not spin on
-	// a broker that returns buffered errors immediately. Context-aware, and
+	// Broker error with no record: back off briefly so the loop does not spin
+	// on a broker that returns buffered errors immediately. Context-aware, and
 	// skipped when the backoff is disabled (0).
-	if sawErr && a.opts.pollErrorBackoff > 0 {
+	if record == nil && sawErr && a.opts.pollErrorBackoff > 0 {
 		select {
 		case <-time.After(a.opts.pollErrorBackoff):
-		case <-a.ctx.Done():
+		case <-a.fetchCtx.Done():
 		}
 	}
-	return nil, false, nil
+
+	// DIAGNOSTIC TRACE COMMENTED OUT (not removed) for the mutex-vs-coincidence
+	// experiment. This call takes a.mu on the per-record delivery path; that added
+	// synchronization (with the arming in triggerAssign) is the suspected reason the
+	// residual franz handoff duplicate stopped reproducing. We re-run the yoyo several
+	// times WITHOUT it to measure the real reproduction rate. It stays here, commented,
+	// so the offset-level handoff logging can be re-enabled to diagnose the residual
+	// once we have confirmed it is real rather than a timing artefact of this lock.
+	// Note a.mu is still taken by OnAssigned/processPendingRebalances (pre-trace); only
+	// the per-record delivery lock is removed, which is exactly the variable under test.
+	// if record != nil {
+	// 	a.traceFirstReadAfterAssign(record)
+	// }
+	return record, false
 }
 
 // handlePollErrors logs per-partition fetch errors and bails the consumer once
@@ -302,8 +446,8 @@ func (a *Adapter) ExtractEnvelope(record *kgo.Record) nexus.Envelope {
 }
 
 // DIAGNOSTIC TRACE commented out for the mutex-vs-coincidence experiment (see the note at
-// the call site in Poll). Re-enable together with the field in adapter.go and the arming in
-// rebalance.go's triggerAssign.
+// the call site in fetchNext). Re-enable together with the field in adapter.go and the
+// arming in rebalance.go's triggerAssign.
 /*
 func (a *Adapter) traceFirstReadAfterAssign(record *kgo.Record) {
 	a.mu.Lock()
