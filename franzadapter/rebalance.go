@@ -30,15 +30,24 @@ func (a *Adapter) OnAssigned(_ context.Context, _ *kgo.Client, assigned map[stri
 // (processPendingRebalances); but AllowRebalance is non-blocking, so franz-go's
 // reassignment raced that deferred commit and, under rebalance churn, reassigned the
 // partition first - the new owner then reprocessed the uncommitted tail (duplicates).
-// The demux drain runs with SyncPollingAlreadyStopped: while a rebalance is in
-// progress franz-go blocks the next poll, so no new records arrive during the drain,
-// and any record already delivered for a revoked partition is handled by the engine's
-// orphaned-work-item protection. Assigns carry no commit-before-release requirement
-// and remain deferred to the poll loop.
+//
+// Exclusivity with record delivery needs no adapter-side lock: franz-go refuses
+// to start this callback while the fetch loop holds a poller registration, and
+// the loop holds one from fetch-return until the engine's dispatch of the
+// record is complete (see the gate protocol on the Adapter fields). So when
+// this drain starts, every record Poll has returned is fully dispatched and
+// visible to it, and no new record can be fetched or delivered until the whole
+// rebalance completes - the fetch loop is parked inside the client, while the
+// engine's Poll keeps returning empty from its channel timeout, responsive to
+// stop signals throughout. Any record already delivered for a revoked
+// partition is handled by the engine's orphaned-work-item protection. Assigns
+// carry no commit-before-release requirement and remain deferred to the poll
+// loop.
 func (a *Adapter) OnRevoked(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
 	if len(revoked) == 0 {
 		return
 	}
+
 	if err := a.triggerRevoke(revoked); err != nil {
 		a.logger.Error(a.ctx, fmt.Sprintf("revoke drain/commit failed: %v", err))
 	}

@@ -69,9 +69,9 @@ import (
 )
 
 // baseKgoOptsCount is the number of kgo.Opt entries added by initClient:
-// 4 base (brokers, group, topic, balancer) + 5 required (auto-commit,
+// 5 base (brokers, group, topic, balancer, logger) + 5 required (auto-commit,
 // block-rebalance, 3 rebalance callbacks).
-const baseKgoOptsCount = 9
+const baseKgoOptsCount = 10
 
 // Adapter wraps a franz-go client implementing nexus.BrokerPort[*kgo.Record].
 //
@@ -101,6 +101,39 @@ type Adapter struct {
 	// error path would violate at-least-once. Poll-goroutine only, no lock.
 	pendingRecord *kgo.Record
 
+	// Dedicated fetch goroutine (started by Subscribe). It is the ONLY caller
+	// of PollRecords and AllowRebalance, so it alone may park inside franz-go's
+	// untimed poll/rebalance exclusion wait, and nothing ever waits on its
+	// return. Poll is a bounded receive from fetchedRecords: the engine's
+	// polling loop can never park inside the client and stays responsive to
+	// its stop and pause signals no matter what the group is doing, matching
+	// the confluent adapter, whose rebalance callbacks run inline on the
+	// polling thread.
+	//
+	// Gate protocol (strict alternation): a fetch that returns a record keeps
+	// its poller registered inside franz-go, which blocks every rebalance
+	// callback (assign, revoke, lost). The fetch loop holds that registration
+	// across the channel handoff AND the engine's dispatch of the record: it
+	// calls AllowRebalance only after recordDispatched signals that the engine
+	// has called Poll again, by which point the polling loop has fully
+	// dispatched the previous record into the pipeline. A rebalance can
+	// therefore only begin between records, never with one fetched but
+	// undispatched, so a revoke's drain always sees every delivered record
+	// (commit-before-release). This also makes the callbacks and record
+	// delivery mutually exclusive without any adapter-side lock: franz-go
+	// itself refuses to start a callback while the registration is held.
+	fetchedRecords   chan *kgo.Record // fetch loop -> Poll; unbuffered, closed on loop exit
+	recordDispatched chan struct{}    // Poll -> fetch loop: previous record fully dispatched
+	fetchLoopDone    chan struct{}    // closed when the fetch loop has exited
+	fetchCtx         context.Context  // cancelled by Unsubscribe to stop the fetch loop
+	fetchCancel      context.CancelFunc
+	fetchStart       sync.Once
+
+	// recordAwaitingDispatch is set when Poll returns a record and consumed at
+	// the top of the next Poll, where the dispatch signal is sent.
+	// Poll-goroutine only, no lock (same discipline as pendingRecord).
+	recordAwaitingDispatch bool
+
 	// DIAGNOSTIC TRACE field commented out for the mutex-vs-coincidence experiment (see the
 	// note at the traceFirstReadAfterAssign call in broker_port.go Poll). Re-enable with the
 	// trace fn/call in broker_port.go and the arming in rebalance.go.
@@ -116,10 +149,17 @@ type Adapter struct {
 	// bandwidth telemetry (nil when not configured)
 	bwCollector *bandwidthCollector
 
+	// clientLog bridges franz-go's internal diagnostics into the consumer's
+	// logger (see clientLogBridge). Created with the client in initClient;
+	// its target logger is attached later, in CreateConsumer. Nil for
+	// NewCustom adapters, whose client configures its own kgo.WithLogger.
+	clientLog *clientLogBridge
+
 	// function fields for testability (wired from client)
 	pollRecordsFn    func(ctx context.Context, maxPollRecords int) kgo.Fetches
 	allowRebalanceFn func()
 	commitRecordsFn  func(ctx context.Context, rs ...*kgo.Record) error
+	leaveGroupFn     func(ctx context.Context) error
 	closeFn          func()
 
 	// fetchCommittedFn queries the group's committed offsets for the given topics
@@ -151,7 +191,7 @@ func New(ctx context.Context, groupID string, brokers ...string) *Adapter {
 // ...). The client is built lazily in CreateConsumer().
 //
 // Your options apply after the base config but before the required ones:
-//   - You CAN override: Balancers, fetch settings, timeouts, SASL, TLS
+//   - You CAN override: Balancers, fetch settings, timeouts, SASL, TLS, WithLogger
 //   - You CANNOT override: DisableAutoCommit, BlockRebalanceOnPoll, rebalance callbacks
 //
 // Topic comes from builder.WithTopicName(). Example with SASL/SCRAM:
@@ -182,12 +222,17 @@ func NewWithOptions(ctx context.Context, groupID string, brokers []string, opts 
 // initClient creates the kgo.Client with the topic from builder.
 // Called from CreateConsumer() when topic is known.
 func (a *Adapter) initClient() error {
+	// the bridge is a base option, so a caller-supplied kgo.WithLogger in
+	// userOpts overrides it (kgo applies options in order)
+	a.clientLog = newClientLogBridge(a.opts.clientLogLevel)
+
 	clientOpts := make([]kgo.Opt, 0, baseKgoOptsCount+len(a.userOpts))
 	clientOpts = append(clientOpts,
 		kgo.SeedBrokers(a.brokers...),
 		kgo.ConsumerGroup(a.groupID),
 		kgo.ConsumeTopics(a.topicName),
 		kgo.Balancers(kgo.CooperativeStickyBalancer()),
+		kgo.WithLogger(a.clientLog),
 	)
 
 	clientOpts = append(clientOpts, a.userOpts...)
@@ -212,7 +257,12 @@ func (a *Adapter) initClient() error {
 	a.pollRecordsFn = client.PollRecords
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
-	a.closeFn = client.Close
+	a.leaveGroupFn = client.LeaveGroupContext
+	// CloseAllowingRebalance, not Close: if the fetch loop exited holding a
+	// poller registration (franz-go registers one even on the fake fetch a
+	// cancelled poll returns), plain Close would deadlock on its own
+	// leave-group rebalance.
+	a.closeFn = client.CloseAllowingRebalance
 	a.fetchCommittedFn = a.newOffsetFetcher(client)
 	return nil
 }
@@ -311,7 +361,9 @@ func (a *Adapter) SetClient(client *kgo.Client) {
 	a.pollRecordsFn = client.PollRecords
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
-	a.closeFn = client.Close
+	a.leaveGroupFn = client.LeaveGroupContext
+	// see initClient for why CloseAllowingRebalance rather than Close
+	a.closeFn = client.CloseAllowingRebalance
 	a.fetchCommittedFn = a.newOffsetFetcher(client)
 }
 
@@ -354,5 +406,8 @@ func (a *Adapter) CreateConsumer(builder nexus.ConsumerBuilder[*kgo.Record]) (ne
 	a.adaptedConsumer = builder.Build(a)
 	a.ctx = a.adaptedConsumer.Context()
 	a.logger = a.adaptedConsumer.Logger()
+	if a.clientLog != nil {
+		a.clientLog.attach(a.ctx, a.logger)
+	}
 	return a.adaptedConsumer, nil
 }
