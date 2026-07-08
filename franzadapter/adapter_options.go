@@ -29,6 +29,12 @@ type adapterOptions struct {
 	// reschedules the pod instead of leaving a zombie replica. Nil uses the
 	// default (os.Exit(1)).
 	bailTerminate func()
+
+	// assignmentOffsetLookup queries the broker for the group's committed offsets
+	// when partitions are assigned (one coordinator round trip per assign event,
+	// batched across partitions), so the consumer starts from a real baseline
+	// instead of the -1 unknown sentinel. Enabled by default.
+	assignmentOffsetLookup bool
 }
 
 // Poll-error handling defaults and bounds.
@@ -41,6 +47,12 @@ const (
 
 	defaultPollErrorBackoff = 25 * time.Millisecond
 	maxPollErrorBackoff     = 5 * time.Second
+
+	// assignmentOffsetLookupTimeout bounds the committed-offset query at assign
+	// time; on timeout the assign proceeds with unknown (-1) baselines. The
+	// coordinator can be mid-move during exactly the churn that produces
+	// assigns, so the lookup must never stall the poll loop for long.
+	assignmentOffsetLookupTimeout = 5 * time.Second
 )
 
 // defaultBailTerminate ends the process after a bail.
@@ -83,13 +95,27 @@ func WithBailTerminate(fn func()) AdapterOption {
 	}
 }
 
+// WithAssignmentOffsetLookup enables or disables the committed-offset query on
+// partition assignment (default: enabled). When enabled, the adapter spends
+// one coordinator round trip per assign event (batched across partitions) to
+// report each partition's real committed offset; when disabled, or when the
+// query fails, the committed offset is reported as -1 (unknown). Disabling
+// saves the round trip at the cost of a rare extra at-least-once redelivery
+// window after abnormal rebalances.
+func WithAssignmentOffsetLookup(enabled bool) AdapterOption {
+	return func(o *adapterOptions) {
+		o.assignmentOffsetLookup = enabled
+	}
+}
+
 // defaultAdapterOptions is the starting point: every field at its default.
 func defaultAdapterOptions() adapterOptions {
 	return adapterOptions{
-		pollErrorLogInterval: defaultPollErrorLogInterval,
-		pollErrorBailAfter:   defaultPollErrorBailAfter,
-		pollErrorBackoff:     defaultPollErrorBackoff,
-		bailTerminate:        defaultBailTerminate,
+		pollErrorLogInterval:   defaultPollErrorLogInterval,
+		pollErrorBailAfter:     defaultPollErrorBailAfter,
+		pollErrorBackoff:       defaultPollErrorBackoff,
+		bailTerminate:          defaultBailTerminate,
+		assignmentOffsetLookup: true,
 	}
 }
 
