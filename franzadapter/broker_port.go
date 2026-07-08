@@ -42,11 +42,44 @@ func (a *Adapter) Unsubscribe() error {
 
 // Poll fetches the next record from franz-go.
 //
-// Uses BlockRebalanceOnPoll pattern - rebalances are blocked during poll,
-// and AllowRebalance() is called after processing to permit them.
+// Uses the BlockRebalanceOnPoll pattern with the gate released at the TOP of
+// each Poll, before the fetch: a rebalance may begin only between Poll calls,
+// i.e. only after the record returned by the previous Poll has been dispatched
+// into the pipeline by the polling loop. The gate is never released while a
+// record is in hand but undelivered, so a revoke's drain always sees every
+// delivered record.
 func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 	if a.pollRecordsFn == nil {
 		return nil, false, fmt.Errorf("client closed")
+	}
+
+	// A record stashed by a previous poll's failed assign trigger takes
+	// precedence over fetching. The rebalance gate stays closed: the record is
+	// in hand and undelivered (see the gate invariant below).
+	if a.pendingRecord != nil {
+		record := a.pendingRecord
+		a.pendingRecord = nil
+		if err := a.processPendingRebalances(); err != nil {
+			a.pendingRecord = record
+			return nil, false, err
+		}
+		return record, true, nil
+	}
+
+	// Release the rebalance gate BEFORE fetching, not after. By the time this
+	// call runs, the record returned by the previous Poll has been fully
+	// dispatched into the pipeline (the polling loop dispatches synchronously
+	// before polling again), so a revoke that starts now is drained AFTER that
+	// record is visible to the drain. The old order (release after PollRecords,
+	// before returning the record) opened the gate while this call's record was
+	// still in hand and undelivered: a cooperative revoke could drain and commit
+	// without it, the record's work was never committed, and the partition's
+	// next owner re-read it (duplicates). franz-go semantics: a poll that
+	// returned records keeps its poller registered (blocking rebalances) until
+	// AllowRebalance; an empty poll self-releases its poller, so an idle
+	// consumer never blocks a rebalance.
+	if a.allowRebalanceFn != nil {
+		a.allowRebalanceFn()
 	}
 
 	ctx, cancel := context.WithTimeout(a.ctx, timeout)
@@ -58,14 +91,6 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		return nil, false, fmt.Errorf("client closed")
 	}
 
-	if a.allowRebalanceFn != nil {
-		a.allowRebalanceFn()
-	}
-
-	if err := a.processPendingRebalances(); err != nil {
-		return nil, false, err
-	}
-
 	// Deliver a record from a healthy partition first; a single failing
 	// partition must not starve the others.
 	var record *kgo.Record
@@ -75,12 +100,42 @@ func (a *Adapter) Poll(timeout time.Duration) (*kgo.Record, bool, error) {
 		}
 	})
 
+	if err := a.processPendingRebalances(); err != nil {
+		// the client already consumed this fetch's record: stash it for the
+		// next poll rather than lose it (at-least-once)
+		a.pendingRecord = record
+		return nil, false, err
+	}
+
+	// Single-topic contract: the engine's offset tracking is keyed by partition
+	// alone, so a record from another topic (a multi-topic or pattern
+	// subscription slipped in via NewCustom) would cross-contaminate committed
+	// offsets. Refuse it and stop the consumer: this is fatal misconfiguration.
+	if record != nil && a.topicName != "" && record.Topic != a.topicName {
+		err := fmt.Errorf("record from topic %q on a consumer configured for %q - "+
+			"one consumer serves one topic; check the client's topic subscription",
+			record.Topic, a.topicName)
+		a.logger.Error(a.ctx, err.Error())
+		a.bail(err)
+		return nil, false, err
+	}
+
 	// Rate-limit-log per-partition fetch errors and bail if one persists.
 	// Errors are absorbed (not returned) so the consumer's poll loop does not
 	// re-log them on every poll.
 	sawErr := a.handlePollErrors(fetches)
 
 	if record != nil {
+		// DIAGNOSTIC TRACE COMMENTED OUT (not removed) for the mutex-vs-coincidence
+		// experiment. This call takes a.mu on the per-record delivery path; that added
+		// synchronization (with the arming in triggerAssign) is the suspected reason the
+		// residual franz handoff duplicate stopped reproducing. We re-run the yoyo several
+		// times WITHOUT it to measure the real reproduction rate. It stays here, commented,
+		// so the offset-level handoff logging can be re-enabled to diagnose the residual
+		// once we have confirmed it is real rather than a timing artefact of this lock.
+		// Note a.mu is still taken by OnAssigned/processPendingRebalances (pre-trace); only
+		// the per-record delivery lock is removed, which is exactly the variable under test.
+		// a.traceFirstReadAfterAssign(record)
 		return record, true, nil
 	}
 
@@ -246,6 +301,24 @@ func (a *Adapter) ExtractEnvelope(record *kgo.Record) nexus.Envelope {
 	}
 }
 
+// DIAGNOSTIC TRACE commented out for the mutex-vs-coincidence experiment (see the note at
+// the call site in Poll). Re-enable together with the field in adapter.go and the arming in
+// rebalance.go's triggerAssign.
+/*
+func (a *Adapter) traceFirstReadAfterAssign(record *kgo.Record) {
+	a.mu.Lock()
+	awaiting := a.traceAwaitFirstRead[record.Partition]
+	if awaiting {
+		delete(a.traceAwaitFirstRead, record.Partition)
+	}
+	a.mu.Unlock()
+	if awaiting {
+		a.logger.Info(a.ctx, fmt.Sprintf("TRACE first-read after assign: partition=%d offset=%d",
+			record.Partition, record.Offset))
+	}
+}
+*/
+
 // CommitOffsets commits the specified messages to the broker.
 func (a *Adapter) CommitOffsets(messages []*nexus.Message[*kgo.Record]) ([]*nexus.Message[*kgo.Record], error) {
 	if len(messages) == 0 {
@@ -262,6 +335,21 @@ func (a *Adapter) CommitOffsets(messages []*nexus.Message[*kgo.Record]) ([]*nexu
 		a.logGroupMembershipHintIfApplicable(err)
 		return nil, fmt.Errorf("commit records failed: %w", err)
 	}
+
+	// DIAGNOSTIC TRACE commented out for the mutex-vs-coincidence experiment (see Poll). This
+	// block does not take a.mu (pure logging), but it is part of the same trace and its log
+	// volume would muddy a clean baseline run, so it is disabled too.
+	/*
+		hi := make(map[int32]int64, 4)
+		seen := make(map[int32]bool, 4)
+		for _, r := range records {
+			if !seen[r.Partition] || r.Offset > hi[r.Partition] {
+				hi[r.Partition] = r.Offset
+				seen[r.Partition] = true
+			}
+		}
+		a.logger.Info(a.ctx, fmt.Sprintf("TRACE commit (highest committed record offset per partition) %v", hi))
+	*/
 
 	a.logger.Debug(a.ctx, fmt.Sprintf("committed %d offsets", len(records)))
 	return nil, nil

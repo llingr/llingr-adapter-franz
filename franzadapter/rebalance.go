@@ -21,12 +21,27 @@ func (a *Adapter) OnAssigned(_ context.Context, _ *kgo.Client, assigned map[stri
 }
 
 // OnRevoked should be passed to kgo.OnPartitionsRevoked when creating the client.
+//
+// The revoked partitions' in-flight work is drained and their offsets committed
+// HERE, synchronously, before this callback returns. franz-go does not proceed with
+// the group's reassignment until OnPartitionsRevoked returns, so committing inside it
+// is the only point at which we can guarantee the commit lands before another member
+// takes the partition. Draining/committing was previously deferred to the poll loop
+// (processPendingRebalances); but AllowRebalance is non-blocking, so franz-go's
+// reassignment raced that deferred commit and, under rebalance churn, reassigned the
+// partition first - the new owner then reprocessed the uncommitted tail (duplicates).
+// The demux drain runs with SyncPollingAlreadyStopped: while a rebalance is in
+// progress franz-go blocks the next poll, so no new records arrive during the drain,
+// and any record already delivered for a revoked partition is handled by the engine's
+// orphaned-work-item protection. Assigns carry no commit-before-release requirement
+// and remain deferred to the poll loop.
 func (a *Adapter) OnRevoked(_ context.Context, _ *kgo.Client, revoked map[string][]int32) {
-	a.mu.Lock()
-	for topic, partitions := range revoked {
-		a.pendingRevoked[topic] = append(a.pendingRevoked[topic], partitions...)
+	if len(revoked) == 0 {
+		return
 	}
-	a.mu.Unlock()
+	if err := a.triggerRevoke(revoked); err != nil {
+		a.logger.Error(a.ctx, fmt.Sprintf("revoke drain/commit failed: %v", err))
+	}
 }
 
 // OnLost should be passed to kgo.OnPartitionsLost when creating the client.
@@ -34,24 +49,27 @@ func (a *Adapter) OnLost(ctx context.Context, _ *kgo.Client, lost map[string][]i
 	a.OnRevoked(ctx, nil, lost)
 }
 
-// processPendingRebalances handles queued rebalance events.
+// processPendingRebalances handles queued assign events from the poll loop.
+// Revokes are NOT queued here: they are drained and committed synchronously inside
+// OnRevoked (franz-go blocks reassignment until that callback returns, which the
+// deferred path could not guarantee). Only assigns, which have no commit-before-release
+// ordering requirement, are processed here.
 func (a *Adapter) processPendingRebalances() error {
 	a.mu.Lock()
 	assigned := a.pendingAssigned
-	revoked := a.pendingRevoked
 	a.pendingAssigned = make(map[string][]int32)
-	a.pendingRevoked = make(map[string][]int32)
 	a.mu.Unlock()
-
-	// process revokes first (important for cooperative rebalancing)
-	if len(revoked) > 0 {
-		if err := a.triggerRevoke(revoked); err != nil {
-			return err
-		}
-	}
 
 	if len(assigned) > 0 {
 		if err := a.triggerAssign(assigned); err != nil {
+			// re-queue: the engine never accepted this assign, so it must be
+			// retried on the next poll. OnAssigned may have queued more in the
+			// meantime; keep the failed batch first.
+			a.mu.Lock()
+			for topic, partitions := range assigned {
+				a.pendingAssigned[topic] = append(partitions, a.pendingAssigned[topic]...)
+			}
+			a.mu.Unlock()
 			return err
 		}
 	}
@@ -64,22 +82,84 @@ func (a *Adapter) triggerAssign(assigned map[string][]int32) error {
 		return nil
 	}
 
+	committed := a.lookupAssignmentOffsets(assigned)
+
 	var info []nexus.RebalanceInfo
 	for topic, partitions := range assigned {
 		for _, p := range partitions {
+			// The lookup normally supplies the partition's real committed offset.
+			// -1 = unknown (lookup disabled, failed, or no offset committed yet).
+			// Never 0: offset 0 is a valid (if rare) offset, so a zero value would
+			// report a real committed position rather than the absence of one.
+			// See TestRebalanceInfo_UnknownBaselineIsMinusOne.
+			offset := int64(-1)
+			if partitionOffsets, ok := committed[topic]; ok {
+				if committedOffset, ok := partitionOffsets[p]; ok && committedOffset >= 0 {
+					offset = committedOffset
+				}
+			}
 			info = append(info, nexus.RebalanceInfo{
-				RebalanceType: nexus.Assign,
-				TopicName:     topic,
-				Partition:     p,
+				RebalanceType:   nexus.Assign,
+				TopicName:       topic,
+				Partition:       p,
+				CommittedOffset: offset,
 			})
 		}
 	}
 
 	a.logger.Info(a.ctx, fmt.Sprintf("partitions assigned: %v", assigned))
+
+	// DIAGNOSTIC TRACE arming commented out for the mutex-vs-coincidence experiment (see the
+	// note at the call site in broker_port.go Poll). This block takes a.mu on the assign
+	// path; removing it (with the per-record call in Poll) is the point of the experiment.
+	/*
+		a.mu.Lock()
+		if a.traceAwaitFirstRead == nil {
+			a.traceAwaitFirstRead = make(map[int32]bool)
+		}
+		for _, partitions := range assigned {
+			for _, p := range partitions {
+				a.traceAwaitFirstRead[p] = true
+			}
+		}
+		a.mu.Unlock()
+	*/
+
 	if err := a.adaptedConsumer.TriggerRebalance(nexus.Assign, info); err != nil {
 		return fmt.Errorf("failed to trigger rebalance (assign): %w", err)
 	}
 	return nil
+}
+
+// lookupAssignmentOffsets queries the broker for the group's committed offsets
+// on freshly assigned partitions: one coordinator round trip per assign event,
+// batched across all topics and partitions, and only ever on assignment (zero
+// steady-state cost). The result seeds RebalanceInfo.CommittedOffset with the
+// real baseline instead of the -1 unknown sentinel. Failure is never fatal:
+// the assign proceeds with -1 and a warning. Disable the round trip with
+// WithAssignmentOffsetLookup(false).
+func (a *Adapter) lookupAssignmentOffsets(assigned map[string][]int32) map[string]map[int32]int64 {
+	if !a.opts.assignmentOffsetLookup || a.fetchCommittedFn == nil {
+		return nil
+	}
+
+	topics := make([]string, 0, len(assigned))
+	for topic := range assigned {
+		topics = append(topics, topic)
+	}
+
+	// bounded: the coordinator can be mid-move during the very churn that
+	// produces assigns, and the poll loop must not stall behind this
+	ctx, cancel := context.WithTimeout(a.ctx, assignmentOffsetLookupTimeout)
+	defer cancel()
+
+	committed, err := a.fetchCommittedFn(ctx, topics)
+	if err != nil {
+		a.logger.Warn(a.ctx, fmt.Sprintf(
+			"assignment offset lookup failed, proceeding with unknown (-1) baselines: %v", err))
+		return nil
+	}
+	return committed
 }
 
 func (a *Adapter) triggerRevoke(revoked map[string][]int32) error {
@@ -94,6 +174,9 @@ func (a *Adapter) triggerRevoke(revoked map[string][]int32) error {
 				RebalanceType: nexus.Revoke,
 				TopicName:     topic,
 				Partition:     p,
+				// unknown; -1 keeps the contract uniform so no reader ever meets a
+				// zero value masquerading as a real offset (see triggerAssign)
+				CommittedOffset: -1,
 			})
 		}
 	}

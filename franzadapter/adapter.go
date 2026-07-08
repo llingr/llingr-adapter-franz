@@ -64,6 +64,7 @@ import (
 
 	"github.com/llingr/llingr-adapter-franz/franzadapter/validate"
 	"github.com/llingr/llingr-nexus/nexus"
+	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -85,10 +86,25 @@ type Adapter struct {
 	// adaptedConsumer for rebalance callbacks (has TriggerRebalance)
 	adaptedConsumer nexus.AdaptedConsumer[*kgo.Record]
 
-	// rebalance coordination
+	// rebalance coordination. Only assigns are queued for the poll loop;
+	// pendingRevoked stays deliberately empty: revokes are drained and
+	// committed synchronously inside OnRevoked (franz-go blocks the group's
+	// reassignment only until that callback returns, so a queued revoke
+	// would race the handoff and duplicate the uncommitted tail). The field
+	// remains to document that asymmetry, and tests pin its emptiness.
 	mu              sync.Mutex
 	pendingAssigned map[string][]int32
 	pendingRevoked  map[string][]int32
+
+	// pendingRecord holds a fetched-but-undelivered record across a failed
+	// assign trigger: the client already consumed it, so dropping it on the
+	// error path would violate at-least-once. Poll-goroutine only, no lock.
+	pendingRecord *kgo.Record
+
+	// DIAGNOSTIC TRACE field commented out for the mutex-vs-coincidence experiment (see the
+	// note at the traceFirstReadAfterAssign call in broker_port.go Poll). Re-enable with the
+	// trace fn/call in broker_port.go and the arming in rebalance.go.
+	// traceAwaitFirstRead map[int32]bool
 
 	// deferred client creation config (for New/NewWithOptions)
 	// client is created in CreateConsumer() when topic is known from builder
@@ -105,6 +121,12 @@ type Adapter struct {
 	allowRebalanceFn func()
 	commitRecordsFn  func(ctx context.Context, rs ...*kgo.Record) error
 	closeFn          func()
+
+	// fetchCommittedFn queries the group's committed offsets for the given topics
+	// (the assignment-time baseline lookup, one coordinator round trip per assign
+	// event). Wired to the admin-client fetch in initClient/SetClient; a function
+	// field for testability. Skipped when WithAssignmentOffsetLookup(false).
+	fetchCommittedFn func(ctx context.Context, topics []string) (map[string]map[int32]int64, error)
 
 	// poll-error handling: rate-limit repeated per-partition fetch-error logs
 	// and stop the consumer if a partition keeps failing. Keyed "topic-partition".
@@ -191,7 +213,48 @@ func (a *Adapter) initClient() error {
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
 	a.closeFn = client.Close
+	a.fetchCommittedFn = a.newOffsetFetcher(client)
 	return nil
+}
+
+// newOffsetFetcher returns the production fetchCommittedFn: an OffsetFetch for
+// the consumer group, routed to the group coordinator via franz-go's admin
+// client package ("kadm" = Kafka admin). This is the same request type kgo
+// itself issues to resolve fetch positions after an assignment, so it adds no
+// new load class to the broker. Partitions with a per-partition error or no
+// committed offset are omitted (callers treat absence as unknown).
+func (a *Adapter) newOffsetFetcher(client *kgo.Client) func(context.Context, []string) (map[string]map[int32]int64, error) {
+	adm := kadm.NewClient(client)
+	return func(ctx context.Context, topics []string) (map[string]map[int32]int64, error) {
+		group := a.groupID
+		if group == "" {
+			// NewCustom adapters configure the group on the kgo.Client directly
+			if g, ok := client.OptValue(kgo.ConsumerGroup).(string); ok {
+				group = g
+			}
+		}
+		if group == "" {
+			return nil, fmt.Errorf("no consumer group configured")
+		}
+
+		responses, err := adm.FetchOffsetsForTopics(ctx, group, topics...)
+		if err != nil {
+			return nil, err
+		}
+
+		committed := make(map[string]map[int32]int64, len(responses))
+		for topic, partitions := range responses {
+			partitionOffsets := make(map[int32]int64, len(partitions))
+			for partition, response := range partitions {
+				if response.Err != nil {
+					continue // absence means unknown (-1)
+				}
+				partitionOffsets[partition] = response.At
+			}
+			committed[topic] = partitionOffsets
+		}
+		return committed, nil
+	}
 }
 
 // WithBandwidthInterval enables bandwidth telemetry at the given cadence.
@@ -249,6 +312,7 @@ func (a *Adapter) SetClient(client *kgo.Client) {
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
 	a.closeFn = client.Close
+	a.fetchCommittedFn = a.newOffsetFetcher(client)
 }
 
 // RequiredOpts are applied automatically in New and NewWithOptions.

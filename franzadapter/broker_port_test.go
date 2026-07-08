@@ -6,6 +6,7 @@ package franzadapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -692,6 +693,177 @@ func TestPoll_ProcessesPendingRebalances(t *testing.T) {
 	}
 	if !mockConsumer.triggerRebalanceCalled {
 		t.Error("expected TriggerRebalance to be called for pending assigns")
+	}
+}
+
+// --- Single-topic contract ---
+
+// A record from a topic other than the configured one means the client was
+// given a multi-topic or pattern subscription (possible via NewCustom). The
+// engine's offset tracking is keyed by partition alone, so delivering it would
+// cross-contaminate offsets between topics; the adapter must refuse the record
+// and stop the consumer instead of proceeding.
+func TestPoll_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	logger := &capturingLogger{}
+	adapter.logger = logger
+	adapter.topicName = "orders"
+	adapter.pendingAssigned = make(map[string][]int32)
+	adapter.pendingRevoked = make(map[string][]int32)
+
+	consumer := &mockAdaptedConsumer{}
+	adapter.adaptedConsumer = consumer
+	terminated := make(chan struct{})
+	adapter.opts.bailTerminate = func() { close(terminated) }
+
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		return makeFetches(&kgo.Record{Key: []byte("k"), Topic: "payments", Partition: 0, Offset: 7})
+	}
+	adapter.allowRebalanceFn = func() {}
+
+	record, ok, err := adapter.Poll(100 * time.Millisecond)
+
+	if err == nil {
+		t.Fatal("a foreign-topic record must surface an error")
+	}
+	if !contains(err.Error(), "payments") || !contains(err.Error(), "orders") {
+		t.Errorf("error should name both topics, got: %v", err)
+	}
+	if ok || record != nil {
+		t.Error("the foreign-topic record must not be delivered to the engine")
+	}
+	// synchronize with the bail goroutine BEFORE reading the logger: its own
+	// error logs race an earlier read, and terminate() is its final act
+	select {
+	case <-terminated:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected the bail path to stop the consumer")
+	}
+	if !logger.errorCalled {
+		t.Error("expected the misconfiguration to be logged as an error")
+	}
+	if !consumer.shutdownCalled.Load() {
+		t.Error("expected Shutdown to be attempted before termination")
+	}
+}
+
+// --- Fetched-record retention across a failed assign trigger ---
+
+// failingOnceAdaptedConsumer rejects the first assign trigger, then behaves.
+type failingOnceAdaptedConsumer struct {
+	mockAdaptedConsumer
+	assignCalls int
+}
+
+func (c *failingOnceAdaptedConsumer) TriggerRebalance(rebalanceType nexus.RebalanceType,
+	info []nexus.RebalanceInfo) error {
+	if rebalanceType == nexus.Assign {
+		c.assignCalls++
+		if c.assignCalls == 1 {
+			return fmt.Errorf("injected assign failure")
+		}
+	}
+	return c.mockAdaptedConsumer.TriggerRebalance(rebalanceType, info)
+}
+
+// Poll must not lose a fetched record when the assign trigger fails: the
+// client has already consumed it, so dropping it on the error path is an
+// at-least-once violation. Unreachable today (the trigger cannot fail for
+// this adapter) but latent. The pending assign must survive the failure too,
+// so the next poll retries it before delivering the stashed record.
+func TestPoll_StashesRecordWhenAssignTriggerFails(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	adapter.pendingAssigned = map[string][]int32{testTopicName: {0}}
+	adapter.pendingRevoked = make(map[string][]int32)
+
+	consumer := &failingOnceAdaptedConsumer{}
+	adapter.adaptedConsumer = consumer
+
+	record := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 7}
+	fetched := false
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		if fetched {
+			return kgo.Fetches{}
+		}
+		fetched = true
+		return makeFetches(record)
+	}
+	adapter.allowRebalanceFn = func() {}
+
+	// first poll: the record is fetched, then the assign trigger fails
+	msg, ok, err := adapter.Poll(100 * time.Millisecond)
+	if err == nil {
+		t.Fatal("first Poll should surface the assign trigger failure")
+	}
+	if ok || msg != nil {
+		t.Fatalf("first Poll must not deliver during the failure: ok=%v msg=%v", ok, msg)
+	}
+
+	// subsequent polls: the assign retries, then the stashed record arrives
+	var delivered []*kgo.Record
+	for i := 0; i < 3; i++ {
+		msg, ok, err := adapter.Poll(100 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("poll %d: unexpected error: %v", i, err)
+		}
+		if ok {
+			delivered = append(delivered, msg)
+		}
+	}
+	if len(delivered) != 1 || delivered[0] != record {
+		t.Fatalf("fetched record lost or duplicated across the failed assign: delivered %d record(s)",
+			len(delivered))
+	}
+	if consumer.assignCalls != 2 {
+		t.Errorf("assign trigger calls = %d, want 2 (fail, then retry)", consumer.assignCalls)
+	}
+}
+
+// --- AllowRebalance ordering (duplicate-window regression) ---
+
+// AllowRebalance must be called at the TOP of Poll, before the fetch, never
+// between the fetch and record delivery. Releasing franz-go's rebalance gate
+// after PollRecords but before the record reaches the engine opens a window
+// where a cooperative revoke (running on franz-go's callback goroutine) drains
+// and commits while the in-hand record is still being dispatched to a worker:
+// the record is processed but never committed (orphaned work), and the partition's
+// next owner re-reads it (duplicates). Releasing the gate at the top instead
+// means a rebalance can only begin between Poll calls, after the polling loop
+// has fully dispatched the previous record, so the revoke drain always sees it.
+func TestPoll_AllowRebalancePrecedesFetch(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+
+	var calls []string
+	adapter.allowRebalanceFn = func() { calls = append(calls, "allow") }
+	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
+		calls = append(calls, "fetch")
+		return makeFetches(&kgo.Record{
+			Key:       []byte("k"),
+			Topic:     testTopicName,
+			Partition: 0,
+			Offset:    int64(len(calls)),
+		})
+	}
+
+	for i := 0; i < 2; i++ {
+		if _, ok, err := adapter.Poll(100 * time.Millisecond); err != nil || !ok {
+			t.Fatalf("poll %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+
+	want := []string{"allow", "fetch", "allow", "fetch"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("call order = %v, want %v (the gate must be released before the fetch so the previous record is dispatched before any rebalance can start)", calls, want)
+		}
 	}
 }
 

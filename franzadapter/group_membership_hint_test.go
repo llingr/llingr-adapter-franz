@@ -180,9 +180,12 @@ func TestCurrentSessionTimeoutDescription_ExplicitOverride(t *testing.T) {
 }
 
 func TestCurrentSessionTimeoutDescription_SubSecondOverride(t *testing.T) {
-	// Edge case: very small session timeout (would be invalid in practice but
-	// the description function should still report it correctly).
-	cl := newClientWithSessionTimeout(t, kgo.SessionTimeout(500*time.Millisecond))
+	// Edge case: very small session timeout; the description function should
+	// still report it correctly. franz-go >= 1.21.5 validates heartbeat <
+	// session timeout at construction, so pair the override with a smaller
+	// heartbeat to keep the client constructible.
+	cl := newClientWithSessionTimeout(t, kgo.SessionTimeout(500*time.Millisecond),
+		kgo.HeartbeatInterval(100*time.Millisecond))
 	a := &Adapter{client: cl}
 	got := a.currentSessionTimeoutDescription()
 	if !strings.Contains(got, "500ms") {
