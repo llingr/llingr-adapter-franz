@@ -1,0 +1,27 @@
+name: Integration
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: integration (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+          cache-dependency-path: integration/go.sum
+      - name: Run integration tests
+        working-directory: integration
+        run: go test -race -timeout 10m ./...

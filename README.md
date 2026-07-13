@@ -2,7 +2,8 @@
 
 [![CI](https://github.com/llingr/llingr-adapter-franz/actions/workflows/ci.yml/badge.svg)](https://github.com/llingr/llingr-adapter-franz/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/llingr/llingr-adapter-franz.svg)](https://pkg.go.dev/github.com/llingr/llingr-adapter-franz)
-[![Go Report Card](https://goreportcard.com/badge/github.com/llingr/llingr-adapter-franz)](https://goreportcard.com/report/github.com/llingr/llingr-adapter-franz)
+[![Lint](https://github.com/llingr/llingr-adapter-franz/actions/workflows/lint.yml/badge.svg)](https://github.com/llingr/llingr-adapter-franz/actions/workflows/lint.yml)
+[![Integration](https://github.com/llingr/llingr-adapter-franz/actions/workflows/integration.yml/badge.svg)](https://github.com/llingr/llingr-adapter-franz/actions/workflows/integration.yml)
 [![Tag](https://img.shields.io/github/v/tag/llingr/llingr-adapter-franz)](https://github.com/llingr/llingr-adapter-franz/tags)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/llingr/llingr-adapter-franz)](go.mod)
