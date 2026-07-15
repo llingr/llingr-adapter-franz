@@ -3,7 +3,7 @@ module github.com/llingr/llingr-adapter-franz
 go 1.25.0
 
 require (
-	github.com/llingr/llingr-nexus v0.10.2
+	github.com/llingr/llingr-nexus v0.11.0
 	github.com/twmb/franz-go v1.21.5
 	github.com/twmb/franz-go/pkg/kadm v1.18.0
 )

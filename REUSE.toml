@@ -1,0 +1,26 @@
+version = 1
+
+# Bulk annotation for files that cannot or should not carry in-file SPDX
+# headers (structured configs, prose, attribution files).
+# precedence = "closest" keeps any in-file header authoritative.
+[[annotations]]
+path = [
+    ".fossa.yml",
+    ".github/**",
+    ".gitignore",
+    "AUTHORS",
+    "CODE_OF_CONDUCT.md",
+    "CONTRIBUTING.md",
+    "COPYRIGHT",
+    "Makefile",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "go.mod",
+    "go.sum",
+    "integration/go.mod",
+    "integration/go.sum",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "Copyright (c) 2025 The llingr-adapter-franz Authors"
+SPDX-License-Identifier = "Apache-2.0"

@@ -167,9 +167,6 @@ func TestNewCustom(t *testing.T) {
 		if o.pollErrorLogInterval != time.Second {
 			t.Errorf("PollErrorLogInterval = %s, want 1s", o.pollErrorLogInterval)
 		}
-		if o.bailTerminate == nil {
-			t.Error("BailTerminate should default to a non-nil action")
-		}
 	})
 }
 
@@ -183,9 +180,6 @@ func TestWithOptions(t *testing.T) {
 		}
 		if a.opts.pollErrorBailAfter != 10*time.Minute {
 			t.Errorf("unset bailAfter = %s, want default 10m", a.opts.pollErrorBailAfter)
-		}
-		if a.opts.bailTerminate == nil {
-			t.Error("unset BailTerminate should default to non-nil")
 		}
 	})
 	t.Run("zero disables bail and backoff", func(t *testing.T) {
@@ -339,10 +333,16 @@ type mockAdaptedConsumer struct {
 	ctx                    context.Context
 	logger                 nexus.Logger
 	shutdownCalled         atomic.Bool
+	trips                  atomic.Int32
+	lastTripReason         atomic.Pointer[error]
 }
 
-func (m *mockAdaptedConsumer) Subscribe() error         { return nil }
-func (m *mockAdaptedConsumer) Shutdown() error          { m.shutdownCalled.Store(true); return nil }
+func (m *mockAdaptedConsumer) Subscribe() error { return nil }
+func (m *mockAdaptedConsumer) Shutdown() error  { m.shutdownCalled.Store(true); return nil }
+func (m *mockAdaptedConsumer) EmergencyShutdown(reason error) {
+	m.trips.Add(1)
+	m.lastTripReason.Store(&reason)
+}
 func (m *mockAdaptedConsumer) TopicName() string        { return "test-topic" }
 func (m *mockAdaptedConsumer) Context() context.Context { return m.ctx }
 func (m *mockAdaptedConsumer) Logger() nexus.Logger     { return m.logger }

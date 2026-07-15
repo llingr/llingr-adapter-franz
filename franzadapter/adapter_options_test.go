@@ -11,7 +11,7 @@ import (
 func TestProcessAdapterOptions_Defaults(t *testing.T) {
 	o := processAdapterOptions()
 	if o.pollErrorBailAfter != 10*time.Minute || o.pollErrorBackoff != 25*time.Millisecond ||
-		o.pollErrorLogInterval != time.Second || o.bailTerminate == nil {
+		o.pollErrorLogInterval != time.Second {
 		t.Errorf("processAdapterOptions() not fully defaulted: %+v", o)
 	}
 }
@@ -69,7 +69,7 @@ func TestProcessOptions_Backoff(t *testing.T) {
 	}
 }
 
-func TestProcessOptions_LogIntervalAndTerminate(t *testing.T) {
+func TestProcessOptions_LogInterval(t *testing.T) {
 	t.Run("non-positive log interval falls back to default", func(t *testing.T) {
 		if got := processAdapterOptions(WithPollErrorLogInterval(0)).pollErrorLogInterval; got != time.Second {
 			t.Errorf("logInterval(0) = %s, want 1s", got)
@@ -81,18 +81,6 @@ func TestProcessOptions_LogIntervalAndTerminate(t *testing.T) {
 	t.Run("explicit log interval passes through", func(t *testing.T) {
 		if got := processAdapterOptions(WithPollErrorLogInterval(5 * time.Second)).pollErrorLogInterval; got != 5*time.Second {
 			t.Errorf("logInterval(5s) = %s, want 5s", got)
-		}
-	})
-	t.Run("nil terminate defaults; supplied terminate retained", func(t *testing.T) {
-		if processAdapterOptions(WithBailTerminate(nil)).bailTerminate == nil {
-			t.Error("nil BailTerminate should default to a non-nil action")
-		}
-		called := false
-		processAdapterOptions(WithBailTerminate(func() {
-			called = true
-		})).bailTerminate()
-		if !called {
-			t.Error("supplied BailTerminate should be retained")
 		}
 	})
 }

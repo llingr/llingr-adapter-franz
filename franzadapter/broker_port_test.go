@@ -558,10 +558,6 @@ func TestFetchNext_BailsAfterSustainedError(t *testing.T) {
 	adapter.opts.pollErrorBailAfter = 20 * time.Millisecond
 	adapter.opts.pollErrorBackoff = 0
 	prepareFetchCtx(adapter)
-	// Stub the process-termination action so the bail does not os.Exit the test
-	// binary; record that it fired.
-	var terminated atomic.Bool
-	adapter.opts.bailTerminate = func() { terminated.Store(true) }
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetchesWithError(1, errors.New("persistent error"))
 	}
@@ -570,15 +566,11 @@ func TestFetchNext_BailsAfterSustainedError(t *testing.T) {
 	time.Sleep(30 * time.Millisecond) // exceed the bail threshold
 	_, _ = adapter.fetchNext()        // trips the bail
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !terminated.Load() {
-		time.Sleep(5 * time.Millisecond)
+	if got := mac.trips.Load(); got != 1 {
+		t.Errorf("EmergencyShutdown called %d times after sustained poll errors, want 1", got)
 	}
-	if !mac.shutdownCalled.Load() {
-		t.Error("expected Shutdown to be called after sustained poll errors")
-	}
-	if !terminated.Load() {
-		t.Error("expected the process to be terminated after the bail Shutdown")
+	if mac.shutdownCalled.Load() {
+		t.Error("bail must escalate through EmergencyShutdown, not graceful Shutdown")
 	}
 }
 
@@ -596,8 +588,6 @@ func TestFetchNext_BailStreakSurvivesHealthyPolls(t *testing.T) {
 	adapter.opts.pollErrorLogInterval = time.Hour
 	adapter.opts.pollErrorBackoff = 0
 	prepareFetchCtx(adapter)
-	var terminated atomic.Bool
-	adapter.opts.bailTerminate = func() { terminated.Store(true) }
 
 	healthy := &kgo.Record{Key: []byte("k"), Topic: testTopicName, Partition: 0, Offset: 1}
 	var call int
@@ -614,11 +604,7 @@ func TestFetchNext_BailStreakSurvivesHealthyPolls(t *testing.T) {
 		time.Sleep(8 * time.Millisecond)
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) && !terminated.Load() {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if !mac.shutdownCalled.Load() || !terminated.Load() {
+	if mac.trips.Load() == 0 {
 		t.Error("expected bail despite interleaved healthy polls (streak must not reset on absence)")
 	}
 }
@@ -735,8 +721,6 @@ func TestFetchNext_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 
 	consumer := &mockAdaptedConsumer{}
 	adapter.adaptedConsumer = consumer
-	terminated := make(chan struct{})
-	adapter.opts.bailTerminate = func() { close(terminated) }
 
 	adapter.pollRecordsFn = func(_ context.Context, _ int) kgo.Fetches {
 		return makeFetches(&kgo.Record{Key: []byte("k"), Topic: "payments", Partition: 0, Offset: 7})
@@ -750,12 +734,9 @@ func TestFetchNext_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 	if !exit {
 		t.Error("the fetch loop must exit after refusing a foreign-topic record")
 	}
-	// synchronize with the bail goroutine BEFORE reading the logger: its own
-	// error logs race an earlier read, and terminate() is its final act
-	select {
-	case <-terminated:
-	case <-time.After(2 * time.Second):
-		t.Fatal("expected the bail path to stop the consumer")
+	// the trip is synchronous within bail, so it is visible here
+	if got := consumer.trips.Load(); got != 1 {
+		t.Fatalf("EmergencyShutdown called %d times for the foreign-topic record, want 1", got)
 	}
 	if !logger.errorCalled {
 		t.Error("expected the misconfiguration to be logged as an error")
@@ -769,8 +750,8 @@ func TestFetchNext_ForeignTopicRecord_RefusesAndBails(t *testing.T) {
 	if !namedBoth {
 		t.Errorf("the log should name both topics, got: %v", logger.errorMsgs)
 	}
-	if !consumer.shutdownCalled.Load() {
-		t.Error("expected Shutdown to be attempted before termination")
+	if consumer.shutdownCalled.Load() {
+		t.Error("bail must escalate through EmergencyShutdown, not graceful Shutdown")
 	}
 }
 
