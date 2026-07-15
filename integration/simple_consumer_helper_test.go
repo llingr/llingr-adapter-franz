@@ -153,6 +153,14 @@ func (c *SimpleConsumer) Shutdown() error {
 	return nil
 }
 
+// EmergencyShutdown satisfies the nexus.EmergencyShutdowner contract the
+// adapter enforces at wiring time; these tests never bail, so a trip is a
+// failure surfaced through Shutdown's normal teardown.
+func (c *SimpleConsumer) EmergencyShutdown(error) {
+	c.running.Store(false)
+	c.cancel()
+}
+
 // TopicName returns the configured topic.
 func (c *SimpleConsumer) TopicName() string {
 	return c.topicName

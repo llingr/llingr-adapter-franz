@@ -1,5 +1,6 @@
 .vscode/
 .idea/
+.claude/
 *.swp
 .DS_Store
 *.out

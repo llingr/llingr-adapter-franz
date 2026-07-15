@@ -175,6 +175,10 @@ type Adapter struct {
 	pollErrLastID map[string]string    // identity of that last logged error (changed error logs immediately)
 	opts          adapterOptions       // poll-error tuning (defaults + validation in adapter_options.go)
 	bailOnce      sync.Once
+	// unsubscribeOnce makes the broker release exactly-once: the engine's
+	// drain, bail's self-release, and any host-side emergency cleanup can all
+	// call Unsubscribe; the first runs it, the rest wait for its completion
+	unsubscribeOnce sync.Once
 }
 
 // New creates a franz-go adapter for the given consumer group. The kgo.Client is
@@ -291,20 +295,26 @@ func (a *Adapter) newOffsetFetcher(client *kgo.Client) func(context.Context, []s
 		if err != nil {
 			return nil, err
 		}
-
-		committed := make(map[string]map[int32]int64, len(responses))
-		for topic, partitions := range responses {
-			partitionOffsets := make(map[int32]int64, len(partitions))
-			for partition, response := range partitions {
-				if response.Err != nil {
-					continue // absence means unknown (-1)
-				}
-				partitionOffsets[partition] = response.At
-			}
-			committed[topic] = partitionOffsets
-		}
-		return committed, nil
+		return mapCommittedOffsets(responses), nil
 	}
+}
+
+// mapCommittedOffsets projects an OffsetFetch response onto fetchCommittedFn's
+// result shape. Partitions with a per-partition error are omitted (callers
+// treat absence as unknown, -1).
+func mapCommittedOffsets(responses kadm.OffsetResponses) map[string]map[int32]int64 {
+	committed := make(map[string]map[int32]int64, len(responses))
+	for topic, partitions := range responses {
+		partitionOffsets := make(map[int32]int64, len(partitions))
+		for partition, response := range partitions {
+			if response.Err != nil {
+				continue
+			}
+			partitionOffsets[partition] = response.At
+		}
+		committed[topic] = partitionOffsets
+	}
+	return committed
 }
 
 // WithBandwidthInterval enables bandwidth telemetry at the given cadence.
@@ -379,6 +389,17 @@ func (a *Adapter) RequiredOpts() []kgo.Opt {
 	}
 }
 
+// closeOnPanic closes the adapter's client, swallowing any secondary panic so
+// it cannot mask the primary panic being propagated. Used to avoid leaking a
+// client this adapter opened when a downstream panic (validate.Client, Build)
+// unwinds through CreateConsumer.
+func (a *Adapter) closeOnPanic() {
+	defer func() { _ = recover() }()
+	if a.closeFn != nil {
+		a.closeFn()
+	}
+}
+
 // CreateConsumer wires the builder to this adapter and returns the consumer.
 // For New/NewWithOptions adapters it also creates and connects the kgo.Client
 // (topic from the builder), returning an error if that fails.
@@ -389,10 +410,12 @@ func (a *Adapter) CreateConsumer(builder nexus.ConsumerBuilder[*kgo.Record]) (ne
 	}
 
 	// If client not yet created (New/NewWithOptions path), create it now
+	createdHere := false
 	if a.client == nil && a.groupID != "" {
 		if err := a.initClient(); err != nil {
 			return nil, err
 		}
+		createdHere = true
 	}
 
 	// Validate we have a client (either from NewCustom+SetClient or New/NewWithOptions)
@@ -400,10 +423,38 @@ func (a *Adapter) CreateConsumer(builder nexus.ConsumerBuilder[*kgo.Record]) (ne
 		return nil, fmt.Errorf("no kgo.Client configured: use New(), NewWithOptions(), or NewCustom()+SetClient()")
 	}
 
+	// validate.Client and builder.Build panic on critical misconfiguration.
+	// If THIS call opened the client, close it before the panic unwinds so a
+	// recovering caller - for example a custom init function wrapping this
+	// library - does not leak the client and its background goroutines. A
+	// custom client injected using SetClient is left to its owner.
+	if createdHere {
+		defer func() {
+			if r := recover(); r != nil {
+				a.closeOnPanic()
+				panic(r)
+			}
+		}()
+	}
+
 	// Validate client configuration - panics on critical misconfigurations, warns on suboptimal
 	validate.Client(a.client)
 
-	a.adaptedConsumer = builder.Build(a)
+	consumer := builder.Build(a)
+
+	// The adapter's protective bail escalates sustained poll failures through
+	// nexus.EmergencyShutdowner; a consumer without it would leave bail no safe
+	// way to stop processing, so the contract is enforced here, at wiring time.
+	if _, ok := consumer.(nexus.EmergencyShutdowner); !ok {
+		if createdHere {
+			a.closeOnPanic()
+		}
+		return nil, fmt.Errorf(
+			"consumer %T does not satisfy nexus.EmergencyShutdowner: this adapter requires "+
+				"a consumer that implements EmergencyShutdown(reason error)", consumer)
+	}
+
+	a.adaptedConsumer = consumer
 	a.ctx = a.adaptedConsumer.Context()
 	a.logger = a.adaptedConsumer.Logger()
 	if a.clientLog != nil {

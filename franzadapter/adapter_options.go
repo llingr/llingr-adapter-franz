@@ -4,7 +4,6 @@
 package franzadapter
 
 import (
-	"os"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -18,7 +17,7 @@ type adapterOptions struct {
 	pollErrorLogInterval time.Duration
 
 	// pollErrorBailAfter is how long a partition may fail continuously before
-	// the consumer stops itself (Shutdown, then process termination), turning a
+	// the consumer stops itself (EmergencyShutdown with the reason), turning a
 	// stuck partition into a reschedulable event rather than silent lag.
 	pollErrorBailAfter time.Duration
 
@@ -26,11 +25,6 @@ type adapterOptions struct {
 	// loop does not spin when kgo returns a buffered error immediately. The
 	// pause is context-aware.
 	pollErrorBackoff time.Duration
-
-	// bailTerminate ends the process after a bail's Shutdown so an orchestrator
-	// reschedules the pod instead of leaving a zombie replica. Nil uses the
-	// default (os.Exit(1)).
-	bailTerminate func()
 
 	// assignmentOffsetLookup queries the broker for the group's committed offsets
 	// when partitions are assigned (one coordinator round trip per assign event,
@@ -81,11 +75,6 @@ const (
 	leaveGroupTimeout = 5 * time.Second
 )
 
-// defaultBailTerminate ends the process after a bail.
-var defaultBailTerminate = func() {
-	os.Exit(1)
-}
-
 // AdapterOption configures poll-error handling; the With* helpers return them.
 type AdapterOption func(*adapterOptions)
 
@@ -110,14 +99,6 @@ func WithPollErrorBailAfter(d time.Duration) AdapterOption {
 func WithPollErrorBackoff(d time.Duration) AdapterOption {
 	return func(o *adapterOptions) {
 		o.pollErrorBackoff = d
-	}
-}
-
-// WithBailTerminate sets the action that ends the process after a bail's
-// Shutdown (nil falls back to the default).
-func WithBailTerminate(fn func()) AdapterOption {
-	return func(o *adapterOptions) {
-		o.bailTerminate = fn
 	}
 }
 
@@ -153,14 +134,12 @@ func defaultAdapterOptions() adapterOptions {
 		pollErrorLogInterval:   defaultPollErrorLogInterval,
 		pollErrorBailAfter:     defaultPollErrorBailAfter,
 		pollErrorBackoff:       defaultPollErrorBackoff,
-		bailTerminate:          defaultBailTerminate,
 		assignmentOffsetLookup: true,
 		clientLogLevel:         kgo.LogLevelInfo,
 	}
 }
 
-// processAdapterOptions folds the options over the defaults, then validates. The
-// one place defaults, overrides, and validation meet.
+// processAdapterOptions applies supplied options over the defaults
 func processAdapterOptions(options ...AdapterOption) adapterOptions {
 	o := defaultAdapterOptions()
 	for _, opt := range options {
@@ -172,18 +151,13 @@ func processAdapterOptions(options ...AdapterOption) adapterOptions {
 	return o
 }
 
-// validate normalises an adapterOptions in place: non-positive log interval and
-// nil terminate fall back to defaults; the switchable durations disable on 0 or
-// negative and otherwise clamp to bounds.
+// validate and normalize (clamp) an adapterOptions
 func (o *adapterOptions) validate() {
 	if o.pollErrorLogInterval <= 0 {
 		o.pollErrorLogInterval = defaultPollErrorLogInterval
 	}
 	o.pollErrorBailAfter = clampBailAfter(o.pollErrorBailAfter)
 	o.pollErrorBackoff = clampBackoff(o.pollErrorBackoff)
-	if o.bailTerminate == nil {
-		o.bailTerminate = defaultBailTerminate
-	}
 }
 
 // clampBailAfter: 0 or negative disables; otherwise clamp to [min, max].

@@ -51,7 +51,18 @@ func (a *Adapter) startFetchLoop() {
 // triggers the final leave-group rebalance; if the loop is parked behind an
 // in-flight rebalance inside the client past the bounded wait, the close
 // proceeds anyway (see fetchLoopStopTimeout).
+//
+// Idempotent: the release runs once, whoever arrives first - the engine's
+// drain, bail's self-release, or a host-side emergency cleanup - and later
+// callers return once it has completed, so none can report done while the
+// leave/close is still in flight.
 func (a *Adapter) Unsubscribe() error {
+	a.unsubscribeOnce.Do(a.releaseBroker)
+	return nil
+}
+
+// releaseBroker is Unsubscribe's body, run exactly once.
+func (a *Adapter) releaseBroker() {
 	if a.bwCollector != nil {
 		a.bwCollector.stop()
 	}
@@ -111,7 +122,6 @@ func (a *Adapter) Unsubscribe() error {
 				time.Since(started).Round(time.Millisecond)))
 		}
 	}
-	return nil
 }
 
 // Poll returns the next record delivered by the fetch loop, waiting at most
@@ -388,29 +398,30 @@ func errIdentity(err error) string {
 	return err.Error()
 }
 
-// bail stops the consumer once, asynchronously, after sustained poll failures,
-// then terminates the process so the orchestrator reschedules the pod rather
-// than leaving a zombie replica consuming nothing. The whole sequence runs in a
-// goroutine because Shutdown stops this very polling loop; calling it inline
-// would deadlock. Termination happens after Shutdown so offsets are committed
-// and in-flight work drains first; it runs even if Shutdown errors, because a
-// stuck partition must not keep the pod alive. The terminate action is
-// configurable via WithBailTerminate (default os.Exit(1)).
+// bail stops the consumer once after sustained poll failures: it trips the
+// consumer's protective shutdown, which notifies the registered shutdown
+// callback with the reason (the callback owns any process-exit policy), and
+// then releases this adapter's own client.
 func (a *Adapter) bail(reason error) {
 	a.bailOnce.Do(func() {
 		a.logger.Error(a.ctx, fmt.Sprintf("stopping consumer after sustained poll failure: %v", reason))
+
+		// unreachable on a wired adapter (CreateConsumer enforces the
+		// contract); covers hand-constructed test adapters
+		es, ok := a.adaptedConsumer.(nexus.EmergencyShutdowner)
+		if !ok {
+			a.logger.Error(a.ctx, "consumer does not implement EmergencyShutdown(reason error); cannot escalate bail")
+			return
+		}
+		// synchronous: the trip is recorded and processing cancelled when
+		// this returns; callback delivery runs on the consumer's observer
+		es.EmergencyShutdown(reason)
+
+		// release our own client (leave group + close) independent of the
+		// fetch goroutine: Unsubscribe waits for the fetch loop to exit, and
+		// the poll-error path calls bail from that loop.
 		go func() {
-			if a.adaptedConsumer != nil {
-				if err := a.adaptedConsumer.Shutdown(); err != nil {
-					a.logger.Error(a.ctx, fmt.Sprintf("shutdown after poll-error bail failed: %v", err))
-				}
-			}
-			terminate := a.opts.bailTerminate
-			if terminate == nil {
-				terminate = defaultBailTerminate
-			}
-			a.logger.Error(a.ctx, "terminating process after poll-error bail so the orchestrator can reschedule")
-			terminate()
+			_ = a.Unsubscribe()
 		}()
 	})
 }

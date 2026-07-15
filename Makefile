@@ -26,8 +26,10 @@ test:
 # Integration tests live in their own module under ./integration/ so the
 # testcontainers/Docker dependency tree doesn't bloat the franzadapter module
 # that downstream consumers pull. Requires Docker on the host.
+# The bail gauntlet runs 250 iterations by default (use LLINGR_FRANZ_STRESS_ITERS
+# to override)
 integration:
-	cd integration && go test $(RACE) -timeout 15m ./...
+	cd integration && go test $(RACE) -timeout 30m ./...
 
 cover: test
 	go tool cover -html=coverage.out
