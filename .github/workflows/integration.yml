@@ -20,6 +20,10 @@ jobs:
           go-version: '1.26.3'
           cache: true
           cache-dependency-path: integration/go.sum
+      # here rather than in CI: this module needs a newer Go than the library's
+      - name: go.mod and go.sum are tidy
+        working-directory: integration
+        run: go mod tidy -diff
       - name: Run integration tests
         working-directory: integration
         run: go test -race -timeout 10m ./...

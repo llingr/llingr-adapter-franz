@@ -25,7 +25,7 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - name: go.mod and go.sum are tidy
-        run: go mod tidy -diff && cd integration && go mod tidy -diff
+        run: go mod tidy -diff
 
   test:
     name: test (race + coverage)
