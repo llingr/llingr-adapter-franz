@@ -387,8 +387,8 @@ make integration
 make
 ```
 
-The franzadapter module's minimum Go version is 1.25 (inherited from
-`franz-go` v1.21+). The integration module requires Go 1.26.3, so contributors
+The franzadapter module's minimum Go version is 1.26 (inherited from
+`franz-go` v1.22+). The integration module requires Go 1.26.3, so contributors
 running `make integration` need a 1.26.3 toolchain installed. Consumers of the
 published `franzadapter` package are unaffected.
 
