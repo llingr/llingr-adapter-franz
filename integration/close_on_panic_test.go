@@ -33,7 +33,7 @@ func (b *panicOnBuildBuilder) Build(nexus.BrokerPort[*kgo.Record]) nexus.Adapted
 // It is the end-to-end counterpart to the kafka adapter's mock-builder test,
 // which covers the equivalent ownsConsumer path with an observable closeFn.
 func TestCreateConsumerClosesClientOnBuildPanic(t *testing.T) {
-	// Baseline the runtime/prior-test goroutines; cluster.Close (deferred
+	// Baseline the runtime/prior-test goroutines; cluster.Stop (deferred
 	// below, so it runs first) reaps kfake's, leaving goleak to flag only a
 	// client goroutine that outlived the panic.
 	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())

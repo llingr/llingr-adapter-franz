@@ -262,9 +262,9 @@ func (a *Adapter) initClient() error {
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
 	a.leaveGroupFn = client.LeaveGroupContext
-	// CloseAllowingRebalance, not Close: if the fetch loop exited holding a
+	// CloseAllowingRebalance, not Stop: if the fetch loop exited holding a
 	// poller registration (franz-go registers one even on the fake fetch a
-	// cancelled poll returns), plain Close would deadlock on its own
+	// cancelled poll returns), plain Stop would deadlock on its own
 	// leave-group rebalance.
 	a.closeFn = client.CloseAllowingRebalance
 	a.fetchCommittedFn = a.newOffsetFetcher(client)
@@ -372,7 +372,7 @@ func (a *Adapter) SetClient(client *kgo.Client) {
 	a.allowRebalanceFn = client.AllowRebalance
 	a.commitRecordsFn = client.CommitRecords
 	a.leaveGroupFn = client.LeaveGroupContext
-	// see initClient for why CloseAllowingRebalance rather than Close
+	// see initClient for why CloseAllowingRebalance rather than Stop
 	a.closeFn = client.CloseAllowingRebalance
 	a.fetchCommittedFn = a.newOffsetFetcher(client)
 }
