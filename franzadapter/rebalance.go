@@ -65,6 +65,12 @@ func (a *Adapter) OnLost(ctx context.Context, _ *kgo.Client, lost map[string][]i
 // ordering requirement, are processed here.
 func (a *Adapter) processPendingRebalances() error {
 	a.mu.Lock()
+	// Poll calls this for every record and an assign is rarely pending: return without
+	// replacing the map, which would otherwise allocate one per record.
+	if len(a.pendingAssigned) == 0 {
+		a.mu.Unlock()
+		return nil
+	}
 	assigned := a.pendingAssigned
 	a.pendingAssigned = make(map[string][]int32)
 	a.mu.Unlock()

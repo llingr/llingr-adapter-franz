@@ -110,7 +110,7 @@ func (a *Adapter) releaseBroker() {
 		}
 	}
 	if a.closeFn != nil {
-		// Close leaves the consumer group and can block behind an in-flight
+		// Stop leaves the consumer group and can block behind an in-flight
 		// rebalance; bracket it so a shutdown wedged here names this step.
 		started := time.Now()
 		if a.logger != nil {
@@ -330,14 +330,21 @@ func (a *Adapter) handlePollErrors(fetches kgo.Fetches) bool {
 	// A partition that delivered a record this poll has recovered. Mere absence
 	// from this poll's errors has not: kgo may just not have fetched it this
 	// round, so absence must not reset the streak or the bail timer never grows.
-	recovered := make(map[string]struct{})
-	fetches.EachRecord(func(r *kgo.Record) {
-		recovered[r.Topic+"-"+strconv.Itoa(int(r.Partition))] = struct{}{}
-	})
-	for key := range recovered {
-		delete(a.pollErrSince, key)
-		delete(a.pollErrLogged, key)
-		delete(a.pollErrLastID, key)
+	// The set is needed only to clear an error streak or to excuse an error from a
+	// partition that delivered records this poll, so its per-record key strings are
+	// built only when a streak exists or this poll returned an error.
+	var recovered map[string]struct{}
+	if fetches.Err() != nil ||
+		len(a.pollErrSince) > 0 || len(a.pollErrLogged) > 0 || len(a.pollErrLastID) > 0 {
+		recovered = make(map[string]struct{})
+		fetches.EachRecord(func(r *kgo.Record) {
+			recovered[r.Topic+"-"+strconv.Itoa(int(r.Partition))] = struct{}{}
+		})
+		for key := range recovered {
+			delete(a.pollErrSince, key)
+			delete(a.pollErrLogged, key)
+			delete(a.pollErrLastID, key)
+		}
 	}
 
 	now := time.Now()

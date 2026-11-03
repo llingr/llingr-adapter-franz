@@ -427,6 +427,47 @@ func TestFetchNext_DeliversRecordDespitePartitionError(t *testing.T) {
 	}
 }
 
+// A partition that reports an error in the same poll as it delivers records has made
+// progress, so the error is excused: no streak starts and the poll is not an error poll.
+func TestHandlePollErrors_ErrorFromPartitionThatDeliveredStartsNoStreak(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+
+	rec := &kgo.Record{Key: []byte("k"), Value: []byte("v"), Topic: testTopicName, Partition: 1, Offset: 5}
+	sawErr := adapter.handlePollErrors(makeFetchesRecordAndError(rec, 1, errors.New("partition 1 boom")))
+
+	if sawErr {
+		t.Error("an error from a partition that delivered records must not count as an error poll")
+	}
+	if len(adapter.pollErrSince) != 0 {
+		t.Errorf("error streaks = %v, want none", adapter.pollErrSince)
+	}
+}
+
+// A healthy poll, with no partition in an error streak, has nothing to clear, so it must
+// not build its per-record recovery keys: that was one string per record.
+func TestHandlePollErrors_HealthyPollAllocatesNothing(t *testing.T) {
+	adapter := NewCustom()
+	adapter.ctx = context.Background()
+	adapter.logger = &capturingLogger{}
+	fetches := makeFetches(
+		&kgo.Record{Key: []byte("a"), Topic: testTopicName, Partition: 0, Offset: 1},
+		&kgo.Record{Key: []byte("b"), Topic: testTopicName, Partition: 1, Offset: 1},
+		&kgo.Record{Key: []byte("c"), Topic: testTopicName, Partition: 1, Offset: 2},
+	)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		if adapter.handlePollErrors(fetches) {
+			t.Fatal("a healthy poll reported an error")
+		}
+	})
+
+	if allocs != 0 {
+		t.Errorf("allocations per healthy poll = %.1f, want 0", allocs)
+	}
+}
+
 // Repeated identical partition errors are logged at most once per log interval.
 func TestFetchNext_RateLimitsErrorLogs(t *testing.T) {
 	adapter := NewCustom()

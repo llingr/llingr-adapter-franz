@@ -537,6 +537,23 @@ func TestProcessPendingRebalances(t *testing.T) {
 			t.Error("should not call TriggerRebalance when nothing pending")
 		}
 	})
+
+	// Poll calls this for every record, so the usual case of nothing pending must not
+	// allocate: one map per record showed up as a measurable share of a consumer's GC.
+	t.Run("allocates nothing when no assign is pending", func(t *testing.T) {
+		adapter := NewCustom()
+		adapter.adaptedConsumer = &mockAdaptedConsumer{}
+
+		allocs := testing.AllocsPerRun(100, func() {
+			if err := adapter.processPendingRebalances(); err != nil {
+				t.Fatalf("processPendingRebalances: %v", err)
+			}
+		})
+
+		if allocs != 0 {
+			t.Errorf("allocations per call with nothing pending = %.1f, want 0", allocs)
+		}
+	})
 }
 
 // orderTrackingConsumer tracks the order of TriggerRebalance calls
