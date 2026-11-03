@@ -1,7 +1,7 @@
 github.com/klauspost/compress v1.20.3 h1:zWNoFqq/lSuYQRim3dUXlXeA0IqwuZGicdG5ZTfY5j4=
 github.com/klauspost/compress v1.20.3/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
-github.com/llingr/llingr-nexus v0.11.0 h1:XzVcXu+MOVyDFkA73RmweYWOaXU+TPtDuOadaXFGGo0=
-github.com/llingr/llingr-nexus v0.11.0/go.mod h1:qU4fV7LCTY7FlLaoDnk9byd075JQdKw5JaYTLoq9rU8=
+github.com/llingr/llingr-nexus v0.11.2 h1:M+myycPbRLWs1yd4OxdxRm3leSwgHJhweJ2sOpV7B18=
+github.com/llingr/llingr-nexus v0.11.2/go.mod h1:qU4fV7LCTY7FlLaoDnk9byd075JQdKw5JaYTLoq9rU8=
 github.com/pierrec/lz4/v4 v4.1.33 h1:GjG1TJ1V4IzKP8L96muuuDNpTwd7D+l2ccXrjAbe014=
 github.com/pierrec/lz4/v4 v4.1.33/go.mod h1:7SE9MC2STkNtL4PIwGhjmyVwvILaGI9/COYQNBhKM/c=
 github.com/twmb/franz-go v1.22.2 h1:EdwIHGzD/4mgCpl/sNS0C74JYn6cL/r2KYS+8UC96Ww=

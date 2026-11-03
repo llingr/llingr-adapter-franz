@@ -9,7 +9,7 @@ replace github.com/llingr/llingr-adapter-franz => ../
 
 require (
 	github.com/llingr/llingr-adapter-franz v0.0.0-00010101000000-000000000000
-	github.com/llingr/llingr-nexus v0.11.0
+	github.com/llingr/llingr-nexus v0.11.2
 	github.com/testcontainers/testcontainers-go/modules/kafka v0.42.0
 	github.com/twmb/franz-go v1.22.2
 	github.com/twmb/franz-go/pkg/kadm v1.19.0
