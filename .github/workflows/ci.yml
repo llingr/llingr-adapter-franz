@@ -1,15 +1,10 @@
 name: CI
 
 on:
-  push:
-  pull_request:
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   GO_VERSION: '1.25'
@@ -18,21 +13,32 @@ jobs:
   build:
     name: build & vet
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - run: go build ./...
       - run: go vet ./...
+      - name: go.mod and go.sum are tidy
+        run: go mod tidy -diff && cd integration && go mod tidy -diff
 
   test:
     name: test (race + coverage)
+    # build & vet is quick; no point spinning up the race suite if the code
+    # doesn't compile or vet cleanly.
+    needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -40,7 +46,7 @@ jobs:
         run: go test -race -coverprofile=coverage.out -coverpkg=./franzadapter/... ./...
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -5
-      - uses: codecov/codecov-action@v7
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage.out
           fail_ci_if_error: false
