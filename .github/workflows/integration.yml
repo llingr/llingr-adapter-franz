@@ -24,6 +24,8 @@ jobs:
       - name: go.mod and go.sum are tidy
         working-directory: integration
         run: go mod tidy -diff
+      # -count=1: setup-go restores the test cache, and a change that touches no Go file
+      # would otherwise pass on a cached result without starting the broker
       - name: Run integration tests
         working-directory: integration
-        run: go test -race -timeout 10m ./...
+        run: go test -race -count=1 -timeout 10m ./...
